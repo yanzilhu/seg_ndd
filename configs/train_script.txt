@@ -1,0 +1,9 @@
+python nddepth/train.py configs/nyu_debug.txt
+
+python nddepth/train.py configs/nyu_train.txt
+tensorboard --logdir=debug_models/1113/nddepth_nyu_debug/summaries
+
+
+eval
+
+python nddepth/eval.py configs/eval_nyu.txt

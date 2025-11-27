@@ -1,0 +1,22 @@
+# 编辑器配置（不上传vscode配置）
+.vscode/
+# 权重目录（核心：不上传权重文件）
+backbone/
+# Python缓存文件（编译后的pyc文件）
+__pycache__/
+# 测试目录（本地测试文件，不上传）
+mytest/
+# 调试模型目录（调试日志/临时模型，不上传）
+debug_models/
+# 图片文件（测试图/结果图，不上传）
+*.png
+*.jpg
+*.jpeg
+# 权重文件兜底（防止漏传.pth/.ckpt）
+*.pth
+*.ckpt
+# 点云测试文件（ply/npy，不上传）
+*.ply
+*.npy
+# TensorBoard日志文件（事件日志，不上传）
+events.out.tfevents.*
