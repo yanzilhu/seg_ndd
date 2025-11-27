@@ -84,7 +84,58 @@ parser.add_argument('--eigen_crop',                            help='if set, cro
 parser.add_argument('--garg_crop',                             help='if set, crops according to Garg  ECCV16', action='store_true')
 parser.add_argument('--eval_freq',                 type=int,   help='Online evaluation frequency in global steps', default=500)
 parser.add_argument('--eval_summary_directory',    type=str,   help='output directory for eval summary,'
-                                                                    'if empty outputs to checkpoint folder', default='')
+                                                                 'if empty outputs to checkpoint folder', default='')
+
+
+def get_planar_mask_from_sem(sem_logits):
+    """
+    根据 SegFormer 的输出生成 平面/非平面 的 0/1 Mask
+    sem_logits: [B, 150, H, W]
+    """
+    # 1. 拿到每个像素的类别索引
+    sem_pred = torch.argmax(sem_logits, dim=1) # [B, H, W]
+    
+    # 2. 定义平面类别的索引列表 (ADE20K index)
+    # 0:wall, 3:floor, 5:ceiling, 10:cabinet, ...
+    planar_classes = [0, 3, 5, 10, 4, 8, 14, 15] # 这里需要你自己查阅 ADE20K index 表补全
+    
+    # 3. 生成 Mask (属于这些类别的为 1，否则为 0)
+    planar_mask = torch.zeros_like(sem_pred).float()
+    for cls_idx in planar_classes:
+        planar_mask = torch.logical_or(planar_mask.bool(), (sem_pred == cls_idx))
+        
+    return planar_mask.float() # [B, H, W], 1代表平面, 0代表非平面
+
+
+def compute_smooth_loss(tgt_map):
+    """
+    计算梯度的 L1 范数 (平滑度损失)
+    tgt_map: [B, C, H, W]
+    return: gradient_map [B, 1, H, W] (为了和 mask 相乘，保持维度一致)
+    """
+    def gradient(x):
+        # 计算 x 方向梯度: I(x+1) - I(x)
+        # 计算 y 方向梯度: I(y+1) - I(y)
+        h_x = x.size()[2]
+        w_x = x.size()[3]
+        
+        # 为了保证维度对齐，我们在最后一行/列补零，或者切片时对齐
+        # 这里采用切片对齐方式：
+        # grad_x: [:, :, :, :-1]
+        grad_x = torch.abs(x[:, :, :, :-1] - x[:, :, :, 1:])
+        grad_y = torch.abs(x[:, :, :-1, :] - x[:, :, 1:, :])
+        
+        return grad_x, grad_y
+
+    grad_x, grad_y = gradient(tgt_map)
+    
+    # 填充回原始大小，保持 H, W 一致以便和 Mask 相乘
+    # grad_x 在 W 维度少 1，grad_y 在 H 维度少 1
+    grad_x = F.pad(grad_x, (0, 1, 0, 0), mode='constant', value=0)
+    grad_y = F.pad(grad_y, (0, 0, 0, 1), mode='constant', value=0)
+    
+    # 对 Channel 维度求均值 (或者求和)，得到每个像素点的梯度大小
+    return grad_x.mean(1, keepdim=True) + grad_y.mean(1, keepdim=True)
 
 if sys.argv.__len__() == 2:
     arg_filename_with_prefix = '@' + sys.argv[1]
@@ -323,10 +374,15 @@ def main_worker(gpu, ngpus_per_node, args):
             # ===================================================
             # depth1_list, uncer1_list, depth2_list, uncer2_list, normal_est_norm, distance_est = model(image, inv_K, epoch)
 
-            depth1_list, uncer1_list, depth2_list, u2_list, normal_est_norm, distance_est, prob_planar = model(image, inv_K, epoch)
+            depth1_list, uncer1_list, depth2_list, uncer2_list, normal_est_norm, distance_est, prob_planar,sem_logits = model(image, inv_K, epoch)
+            with torch.no_grad():
+                gt_planar_mask = get_planar_mask_from_sem(sem_logits)
             
-            # 上采样 prob_planar 到原图大小 (如果模型里没做的话)
-            # prob_planar = F.interpolate(prob_planar, size=mask_planar_gt.shape[2:], mode='bilinear', align_corners=False)
+            # 2. 计算分类 Loss (Auxiliary Loss)
+            # prob_planar 是你新加的那个 head 的输出 [B, 2, H, W]
+            # 我们希望 prob_planar[:, 1, ...] (平面概率) 接近 gt_planar_mask
+            loss_sem_aux = F.cross_entropy(prob_planar, gt_planar_mask.long())
+
             # ===========================================
 
             if args.dataset == 'nyu':
@@ -378,23 +434,33 @@ def main_worker(gpu, ngpus_per_node, args):
             loss_normal = 5 * ((1 - (normal_gt_norm * normal_est_norm).sum(1, keepdim=True)) * mask.float()).sum() / (mask.float() + 1e-7).sum()
             # 距离损失监督模型预测平面到原点的距离 ($\mathcal{D}$)。这是几何分支计算深度公式 $D = \mathcal{D} / (N^T K^{-1} uv)$ 的分母部分，必须准确。
             loss_distance = 0.25 * torch.abs(distance_gt[mask] - distance_est[mask]).mean()
-            # loss 
-            # segment, planar_mask, dissimilarity_map = compute_seg(image, normal_est_norm, distance_est[:, 0])
-            # loss_grad_normal, loss_grad_distance = get_smooth_ND(normal_est_norm, distance_est, planar_mask)
+            
+            # 3. 计算 几何一致性 Loss (改进 NDDepth 的部分)
+            # 只在 mask == 1 (平面区域) 施加 平滑/一致性 约束
+            grad_normal_map = compute_smooth_loss(normal_est_norm)
+            gt_planar_mask_expanded = gt_planar_mask.unsqueeze(1).float()  # [2, 1, 120, 160]
+            
+            # 下采样 grad_normal_map 到相同分辨率
+            grad_normal_map_resized = F.interpolate(
+                grad_normal_map, 
+                size=(gt_planar_mask.shape[1], gt_planar_mask.shape[2]),
+                mode='bilinear',
+                align_corners=False
+            )  # [2, 1, 120, 160]
+            loss_normal_consistency = (grad_normal_map_resized * gt_planar_mask_expanded).sum() / (gt_planar_mask_expanded.sum() + 1e-6)
 
-            # loss = (loss_depth1 + loss_depth2) / weights_sum + loss_depth1_0 + loss_depth2_0 + loss_uncer1 + loss_uncer2 + loss_normal + loss_distance + 0.01 * loss_grad_normal + 0.01 * loss_grad_distance
-            # [修改 2] 计算你的平面约束 Loss (使用 dataloader 加载的 mask_planar)
-            # mask_planar 已经在前面通过 sample_batched['mask_planar'] 获取了
-            # loss_plane = compute_plane_loss(normal_est_norm, distance_est, mask_planar)
-            loss_plane_normal = compute_strong_plane_loss(normal_est_norm, distance_est, mask_planar)
+            # loss_plane_normal = compute_strong_plane_loss(normal_est_norm, distance_est, mask_planar)
             # 这里的结构是：深度Loss + 不确定性Loss + 法向/距离监督Loss + 平面约束Loss
             loss = (loss_depth1 + loss_depth2) / weights_sum + \
                    loss_depth1_0 + loss_depth2_0 + \
                    loss_uncer1 + loss_uncer2 + \
                    loss_normal + loss_distance + \
-                   0.01 * loss_plane_normal  # <--- 这里加上你的约束
+                   0.01 * loss_normal_consistency +0.1*loss_sem_aux # <--- 这里加上你的约束
 
             loss.backward()
+
+
+
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=10, norm_type=2)
 
             for param_group in optimizer.param_groups:

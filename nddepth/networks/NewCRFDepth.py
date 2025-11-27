@@ -240,8 +240,14 @@ class NewCRFDepth(nn.Module):
         # depth
         ppm_out = self.decoder(feats)  #B,512,115,20
 
-
-        # PGM
+        e3 = self.crf3(feats[3], ppm_out)
+        e3 = nn.PixelShuffle(2)(e3)
+        e2 = self.crf2(feats[2], e3)
+        e2 = nn.PixelShuffle(2)(e2)
+        e1 = self.crf1(feats[1], e2)
+        e1 = nn.PixelShuffle(2)(e1)
+        e0 = self.crf0(feats[0], e1)
+# PGM
         #  ------------------------------------------------------------
         # Step A：提取语义 logits（不训练）
         # SegFormer 输出为 B×150×H/4×W/4 → resize 到 e0 大小
@@ -268,17 +274,6 @@ class NewCRFDepth(nn.Module):
     
         # =======================================================================
 
-        e3 = self.crf3(feats[3], ppm_out)
-        e3 = nn.PixelShuffle(2)(e3)
-        e2 = self.crf2(feats[2], e3)
-        e2 = nn.PixelShuffle(2)(e2)
-        e1 = self.crf1(feats[1], e2)
-        e1 = nn.PixelShuffle(2)(e1)
-        e0 = self.crf0(feats[0], e1)
-
-        
-        # 原来的 e0 替换为 e0_enhanced 输入给各个 Head
-        # 注意：mask_head 如果是用于上采样的，可以用原始 e0 或者 enhanced e0，建议 enhanced
         if self.up_mode == 'mask':
             mask = self.mask_head(e0)
             d1 = self.disp_head1(e0, 1)
@@ -329,7 +324,7 @@ class NewCRFDepth(nn.Module):
             n1_norm = upsample(n1_norm, scale_factor=4)
             distance = upsample(distance, scale_factor=4)
 
-            return depth1, u1, depth2, u2, n1_norm, distance,prob_planar
+            return depth1, u1, depth2, u2, n1_norm, distance,prob_planar,sem_logits
             # return depth1, u1, depth2, u2, n1_norm, distance
         
         else:
@@ -348,7 +343,7 @@ class NewCRFDepth(nn.Module):
             n1_norm = upsample(n1_norm, scale_factor=4)
             distance = upsample(distance, scale_factor=4)
 
-            return depth1_list, u1, depth2_list, u2, n1_norm, distance,prob_planar  
+            return depth1_list, u1, depth2_list, u2, n1_norm, distance,prob_planar ,sem_logits
             # return depth1_list, u1, depth2_list, u2, n1_norm, distance                                                         
                     
 class DispHead(nn.Module):
