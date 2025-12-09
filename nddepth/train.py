@@ -158,14 +158,17 @@ def online_eval(model, dataloader_eval, gpu, ngpus, group, epoch, post_process=F
 
             image = torch.autograd.Variable(eval_sample_batched['image'].cuda(gpu, non_blocking=True))
             inv_K = torch.autograd.Variable(eval_sample_batched['inv_K'].cuda(gpu, non_blocking=True))
-            depth1_list, uncer1_list, depth2_list, uncer2_list, _, _ = model(image, inv_K, epoch)
+            # depth1_list, uncer1_list, depth2_list, uncer2_list, _, _ = model(image, inv_K, epoch)
+            depth1_list, uncer1_list, depth2_list, uncer2_list, _, _, _, _ = model(image, inv_K, epoch)
             if epoch < 5:
                 pred_depth = 0.5 * (depth1_list + depth2_list)
             else:
                 pred_depth = 0.5 * (depth1_list[-1] + depth2_list[-1])
             if post_process:
                 image_flipped = flip_lr(image)
-                depth1_list_flipped, uncer1_list_flipped, depth2_list_flipped, uncer2_list_flipped, _, _ = model(image_flipped, inv_K, epoch)
+                depth1_list_flipped, uncer1_list_flipped, depth2_list_flipped, uncer2_list_flipped, _, _,_,_ = model(image_flipped, inv_K, epoch)
+                # depth1_list_flipped, uncer1_list_flipped, depth2_list_flipped, uncer2_list_flipped, _, _ = model(image_flipped, inv_K, epoch)
+
                 if epoch < 5:
                     pred_depth_flipped = 0.5 * (depth1_list_flipped + depth2_list_flipped)
                 else:
@@ -499,8 +502,8 @@ def main_worker(gpu, ngpus_per_node, args):
                     # writer.add_scalar('grad_distance_loss', loss_grad_distance, global_step)
                     writer.add_scalar('learning_rate', current_lr, global_step)
                     writer.add_scalar('var average', var_sum.item()/var_cnt, global_step)
-
-                    writer.add_scalar('plane_consistency_loss', loss_plane_normal, global_step) # 记录你的新 Loss
+                    writer.add_scalar('loss_normal_consistency', loss_normal_consistency, global_step) # 记录你的新 Loss
+                    writer.add_scalar('loss_sem_aux', loss_sem_aux, global_step) # 记录你的新 Loss
 
                     writer.flush()
 

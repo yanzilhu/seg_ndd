@@ -15,7 +15,7 @@ class PlaneGuidanceModule(nn.Module):
     """
     语义条件化平面查询模块 PGM
     输入:
-        feat: CRF 最后一层特征 e0 (B×C×H×W)
+        feat: CRF 最后一层特征 e0 (B×C×H×W) 
         sem_emb: 语义 embedding (B×C×H×W)
     输出:
         enhanced_feat  (融合语义+几何)
@@ -238,7 +238,7 @@ class NewCRFDepth(nn.Module):
             feats = self.neck(feats)
         
         # depth
-        ppm_out = self.decoder(feats)  #B,512,115,20
+        ppm_out = self.decoder(feats)  #B,512,15,20
 
         e3 = self.crf3(feats[3], ppm_out)
         e3 = nn.PixelShuffle(2)(e3)

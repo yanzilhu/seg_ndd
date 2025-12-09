@@ -151,7 +151,7 @@ def main_worker(args):
     if args.checkpoint_path != '':
         if os.path.isfile(args.checkpoint_path):
             print("== Loading checkpoint '{}'".format(args.checkpoint_path))
-            checkpoint = torch.load(args.checkpoint_path, map_location='cpu')
+            checkpoint = torch.load(args.checkpoint_path, map_location='cpu',weights_only=False)
             model.load_state_dict(checkpoint['model'])
             print("== Loaded checkpoint '{}'".format(args.checkpoint_path))
             del checkpoint
