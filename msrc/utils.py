@@ -108,9 +108,15 @@ class silog_loss(nn.Module):
         self.min_depth = float(min_depth)
 
     def forward(self, depth_est, depth_gt, mask):
-        
-        d = torch.log(depth_est[mask]) - torch.log(depth_gt[mask])
-        return torch.sqrt((d ** 2).mean() - self.variance_focus * (d.mean() ** 2)) * 10.0
+        de = depth_est.to(torch.float32).clamp_min(self.min_depth)
+        dg = depth_gt.to(torch.float32).clamp_min(self.min_depth)
+        m  = mask.to(torch.bool)
+        d = torch.log(de[m]) - torch.log(dg[m])
+        var = (d ** 2).mean() - (d.mean() ** 2)
+        res = (var + (1.0 - self.variance_focus) * (d.mean() ** 2)).clamp_min(0.0)
+        return torch.sqrt(res) * 10.0
+        # d = torch.log(depth_est[mask]) - torch.log(depth_gt[mask])
+        # return torch.sqrt((d ** 2).mean() - self.variance_focus * (d.mean() ** 2)) * 10.0
 
 
 def flip_lr(image):

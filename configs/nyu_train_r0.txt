@@ -6,8 +6,8 @@
 --data_path /home/h/yz/data/nyu_depth_v2/sync/
 --gt_path /home/h/yz/data/nyu_depth_v2/sync/
 --filenames_file data_splits/nyudepthv2_train_files_with_gt_dense.txt
---batch_size 2
---num_epochs 5
+--batch_size 4
+--num_epochs 50
 --learning_rate 2e-5
 --weight_decay 1e-2
 --adam_eps 1e-3
@@ -15,18 +15,19 @@
 --input_height 480
 --input_width 640
 --max_depth 10
---do_random_rotate
 --degree 2.5
 --log_directory ./debug_models/
 --multiprocessing_distributed
---dist_url tcp://127.0.0.1:235
+--dist_url tcp://127.0.0.1:2353
 
 --log_freq 100
 --do_online_eval
---eval_freq 10000
+--eval_freq 1000
 --data_path_eval /home/h/yz/data/nyu_depth_v2/official_splits/test/
 --gt_path_eval /home/h/yz/data/nyu_depth_v2//official_splits/test/
 --filenames_file_eval data_splits/nyudepthv2_test_files_with_gt.txt
 --min_depth_eval 1e-3
 --max_depth_eval 10
 --eigen_crop
+--accumulation_steps 2
+--checkpoint_path   debug_models/1214/nddepth_nyu_debug/model-50000-best_rms_0.33106

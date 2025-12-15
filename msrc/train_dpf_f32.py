@@ -19,7 +19,8 @@ from utils import post_process_depth, flip_lr, silog_loss, DN_to_distance, DN_to
                        block_print, enable_print, normalize_result, inv_normalize, convert_arg_line_to_args, compute_seg, get_smooth_ND, normalize_image,compute_plane_loss, \
                        compute_strong_plane_loss
 # from networks.NewCRFDepth import NewCRFDepth
-from networks.NewCRFDepth_nd import NewCRFDepth
+from networks.NewCRFDepth_dpf import NewCRFDepth
+from networks.dpf_fl32 import NewCRFDepth
 from datetime import datetime
 
 # from skimage.segmentation import all_felzenszwalb as felz_seg
@@ -88,44 +89,175 @@ parser.add_argument('--eval_summary_directory',    type=str,   help='output dire
                                                                  'if empty outputs to checkpoint folder', default='')
 parser.add_argument('--accumulation_steps',        type=int,   help='gradient accumulation steps', default=1)
 
-
-def get_planar_mask_from_sem(sem_logits):
+# ------------------------DPF
+def manhattan_alignment_loss(n_unit, R, P, mask=None, eps=1e-6):
     """
-    根据 SegFormer 的输出生成 平面/非平面 的 0/1 Mask
-    sem_logits: [B, 150, H, W]
+    n_unit: (B,3,H,W) 已归一化法线（如 n1_norm）
+    R:      (B,3,3)   每图的Manhattan基（列为轴向）
+    P:      (B,3,H,W) 平面门控概率（例如[墙,地,顶]）
+    mask:   (B,1,H,W) 有效像素掩码（可为None）
+    目标：让法线在各自门控下贴近对应主轴（软分配）
+    L = sum_{i=1..3} mean( P_i * (1 - |n · axis_i|) )
     """
-    # 1. 拿到每个像素的类别索引
-    sem_pred = torch.argmax(sem_logits, dim=1) # [B, H, W]
-    
-    # 2. 定义平面类别的索引列表 (ADE20K index)
-    # 0:wall, 3:floor, 5:ceiling, 10:cabinet, ...
-    planar_classes = [0, 3, 5, 10, 4, 8, 14, 15] # 这里需要你自己查阅 ADE20K index 表补全
-    
-    # 3. 生成 Mask (属于这些类别的为 1，否则为 0)
-    planar_mask = torch.zeros_like(sem_pred).float()
-    for cls_idx in planar_classes:
-        planar_mask = torch.logical_or(planar_mask.bool(), (sem_pred == cls_idx))
-        
-    return planar_mask.float() # [B, H, W], 1代表平面, 0代表非平面
+    B, _, H, W = n_unit.shape
+    axes = [R[:, :, 0], R[:, :, 1], R[:, :, 2]]  # 每个轴 (B,3)
 
-# def compute_gate_loss(depth_geo, depth_pixel, depth_gt, gate_logits, mask_valid):
-#     """
-#     Args:
-#         gate_logits: 未经过 Sigmoid 的网络输出
-#     """
-#     # 1. 生成伪标签 (0 或 1)
-#     err_geo = torch.abs(depth_geo - depth_gt)
-#     err_pixel = torch.abs(depth_pixel - depth_gt)
-#     gate_target = (err_geo < err_pixel).float()
+    loss = 0.0
+    denom = 0.0
+    for i in range(3):
+        ai = axes[i].view(B, 3, 1, 1).expand(-1, -1, H, W)  # (B,3,H,W)
+        cosi = torch.sum(n_unit * ai, dim=1, keepdim=True).abs()  # (B,1,H,W)
+        li = (1.0 - cosi).clamp(min=0.0) * P[:, i:i+1, :, :]      # (B,1,H,W)
+        if mask is not None:
+            li = li * mask
+            denom += mask.sum() + 1e-6
+        else:
+            denom += li.numel()
+        loss += li.sum()
+    return loss / (denom + eps)
+
+
+def plane_distance_smooth_var_loss(distance, P, mask=None, eps=1e-6):
+    """
+    distance: (B,1,H,W) 到原点距离（你模型的 distance_head 输出 * max_depth）
+    P:        (B,K,H,W) 平面门控（如K=3）
+    由两部分构成：
+      - TV平滑：sum_k mean( P_k * (|dx d| + |dy d|) )
+      - 区域方差：sum_k Var_{P_k}(distance)
+    """
+    B, _, H, W = distance.shape
+    K = P.shape[1]
+
+    dx = torch.abs(distance[:, :, :, 1:] - distance[:, :, :, :-1])
+    dy = torch.abs(distance[:, :, 1:, :] - distance[:, :, :-1, :])
+
+    tv = 0.0
+    tv_denom = 0.0
+    for k in range(K):
+        Pk = P[:, k:k+1, :, :]
+        if mask is not None:
+            Pk = Pk * mask
+
+        tvx = (Pk[:, :, :, 1:] * dx).sum()
+        tvy = (Pk[:, :, 1:, :] * dy).sum()
+        tv += tvx + tvy
+        tv_denom += (Pk[:, :, :, 1:]).sum() + (Pk[:, :, 1:, :]).sum() + eps
+
+    # 区域方差：对每个k，μ_k = sum(P_k * d)/sum(P_k)
+    var_loss = 0.0
+    for k in range(K):
+        Pk = P[:, k:k+1, :, :]
+        if mask is not None:
+            Pk = Pk * mask
+        wsum = Pk.sum() + eps
+        mu = (Pk * distance).sum() / wsum
+        var = ((Pk * (distance - mu)) ** 2).sum() / wsum
+        var_loss += var
+
+    tv_term = tv / (tv_denom + eps)
+    return tv_term + var_loss
+
+
+def plane_reconstruction_loss(z_pred, z_plane, mask=None, delta=0.1, eps=1e-6):
+    """
+    z_pred:  (B,1,H,W) 网络预测深度（可取两路的平均/最终细化输出）
+    z_plane: (B,1,H,W) DPF层拼回的平面深度
+    Huber(SmoothL1) 损失
+    """
+    diff = z_pred - z_plane
+    if mask is not None:
+        diff = diff * mask
+        denom = mask.sum() + eps
+    else:
+        denom = diff.numel()
+    abs_diff = diff.abs()
+    huber = torch.where(abs_diff < delta, 0.5 * (abs_diff ** 2) / delta, abs_diff - 0.5 * delta)
+    return huber.sum() / denom
+
+
+def geometry_losses(
+    n_unit,                # (B,3,H,W)
+    distance,              # (B,1,H,W)
+    R, P,                  # (B,3,3), (B,K,H,W)
+    z_pred, z_plane,       # (B,1,H,W), (B,1,H,W)
+    mask=None,
+    w_align=1.0, w_plane_smooth=1.0, w_recon=1.0
+):
+    L_align = manhattan_alignment_loss(n_unit, R, P, mask)
+    L_plane  = plane_distance_smooth_var_loss(distance, P, mask)
+    L_recon  = plane_reconstruction_loss(z_pred, z_plane, mask)
+    L_total  = w_align * L_align + w_plane_smooth * L_plane + w_recon * L_recon
+    return {
+        'L_align': L_align,
+        'L_plane': L_plane,
+        'L_recon': L_recon,
+        'L_geom_total': L_total
+    }
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import os
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import os
+from PIL import Image
+def visualize_p_full(image, p_full, save_path, step):
+    """
+    image: (B, 3, H, W) 原始图像 Tensor
+    p_full: (B, 3, H, W) 平面门控概率 Tensor
+    save_path: 保存路径
+    step: 当前步数
+    """
+    # 1. 数据预处理：取 Batch 中的第一个样本并转为 Numpy
+    img = image[0].detach().cpu().numpy().transpose(1, 2, 0)
+
+    img = (img - img.min()) / (img.max() - img.min() + 1e-8)*255
+    img_np = img.astype(np.uint8)
+
+    # p_full 形状为 (3, H, W)
+    probs = p_full[0].detach().cpu().numpy()
+    # 4. 保存原图
+    os.makedirs(save_path, exist_ok=True)
+
+    Image.fromarray(img_np).save(os.path.join(save_path, f'img_step_{step}.png'))
+    # 5. 保存三个概率图（灰度图）
+    for i, name in enumerate(['wall', 'floor', 'ceiling']):
+        # 归一化概率到 0-255
+        prob_img = (probs[i] * 255).astype(np.uint8)
+        Image.fromarray(prob_img).save(
+            os.path.join(save_path, f'prob_{name}_step_{step}.png')
+        )
     
-#     # 2. 使用 WithLogits 计算 Loss (数值稳定，支持 AMP)
-#     # 注意：输入是 logits，不需要手动 sigmoid
-#     loss = F.binary_cross_entropy_with_logits(
-#         gate_logits[mask_valid], 
-#         gate_target[mask_valid]
-#     )
+    # # 2. 创建绘图窗口
+    # fig, axes = plt.subplots(1, 4, figsize=(20, 5))
     
-#     return loss
+    # # 展示原图
+    # axes[0].imshow(img)
+    # axes[0].set_title("Original Image")
+    # axes[0].axis('off')
+    
+    # # 展示三个通道
+    # titles = ['Wall Probability', 'Floor Probability', 'Ceiling Probability']
+    # cmaps = ['Reds', 'Greens', 'Blues'] # 使用不同颜色区分
+    
+    # for i in range(3):
+    #     im = axes[i+1].imshow(probs[i], cmap=cmaps[i], vmin=0, vmax=1)
+    #     axes[i+1].set_title(titles[i])
+    #     axes[i+1].axis('off')
+    #     fig.colorbar(im, ax=axes[i+1], fraction=0.046, pad=0.04)
+
+    # # 3. 保存
+    # plt.tight_layout()
+    # if not os.path.exists(save_path):
+    #     os.makedirs(save_path)
+    # plt.savefig(os.path.join(save_path, f'p_full_step_{step}.png'))
+    # plt.close()
+
+    
+
+# -----------------
 
 # 再次提醒：train.py 中的 compute_gate_loss 必须是 Soft Label 版本
 def compute_gate_loss(depth_geo, depth_pixel, depth_gt, gate_logits, mask_valid):
@@ -200,17 +332,14 @@ def online_eval(model, dataloader_eval, gpu, ngpus, group, epoch, post_process=F
 
             image = torch.autograd.Variable(eval_sample_batched['image'].cuda(gpu, non_blocking=True))
             inv_K = torch.autograd.Variable(eval_sample_batched['inv_K'].cuda(gpu, non_blocking=True))
-            depth_final, gate_logits_full, depth1, u1, depth2, u2, n1, dist=model(image, inv_K, epoch)
+            depth1, u1, depth2, u2, n1_norm, distance,final_depth,R,P_full,z_plane,_=model(image, inv_K, epoch)
+            # depth_final, gate_logits_full, depth1, u1, depth2, u2, n1, dist=model(image, inv_K, epoch)
 
-            # 计算 Alpha Map (归一化到 0~1)
-            alpha_map = torch.sigmoid(gate_logits_full)
-            pred_depth=depth_final
-            if post_process:
-                image_flipped = flip_lr(image)
-                depth_final_flipped, gate_logits_full_flipped, depth1_flipped, u1_flipped, depth2_flipped, u2_flipped, _,_= model(image_flipped, inv_K, epoch)
-                
-                pred_depth = post_process_depth(depth_final, depth_final_flipped)
-
+            pred_depth=final_depth
+            # if post_process:
+            #     image_flipped = flip_lr(image)
+            #     depth1_flipped, u1_flipped, depth2_flipped, u2_flipped, n1_norm_flipped, distance_flipped,final_depth_flipped,_,_,_= model(image_flipped, inv_K, epoch)
+            #     pred_depth = post_process_depth(final_depth, depth1_flipped)
             pred_depth = pred_depth.cpu().numpy().squeeze()
             gt_depth = gt_depth.cpu().numpy().squeeze()
 
@@ -299,10 +428,10 @@ def main_worker(gpu, ngpus_per_node, args):
             torch.cuda.set_device(args.gpu)
             model.cuda(args.gpu)
             args.batch_size = int(args.batch_size / ngpus_per_node)
-            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=False)
+            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         else:
             model.cuda()
-            model = torch.nn.parallel.DistributedDataParallel(model, find_unused_parameters=False)
+            model = torch.nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
     else:
         model = torch.nn.DataParallel(model)
         model.cuda()
@@ -415,57 +544,68 @@ def main_worker(gpu, ngpus_per_node, args):
             inv_K = torch.autograd.Variable(sample_batched['inv_K'].cuda(args.gpu, non_blocking=True))
             inv_K_p = torch.autograd.Variable(sample_batched['inv_K_p'].cuda(args.gpu, non_blocking=True))
 
-            # 注意：forward 返回值顺序变了，要对应上
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                # print("开始训练")
-                depth_final, alpha, depth1, uncer1, depth2, uncer2, normal_est, distance_est = model(image, inv_K, epoch)
-
-                if args.dataset == 'nyu':
+          
+            depth1, u1, depth2, u2, n1_norm, distance,final_depth,R,P_full,z_plane,_=model(image, inv_K, epoch)
+            if args.dataset == 'nyu':
                     mask = depth_gt > 0.1
-                else:
+            else:
                     mask = depth_gt > 1.0
                 
-                # 1. 基础深度 Loss (两个头单独的监督)
-                loss_depth1 = silog_criterion.forward(depth1, depth_gt, mask)
-                loss_depth2 = silog_criterion.forward(depth2, depth_gt, mask)
+            if epoch<5:
+                    loss_depth1 = silog_criterion.forward(depth1, depth_gt, mask)
+                    loss_depth2 = silog_criterion.forward(depth2, depth_gt, mask)
+                    uncer1_gt = torch.exp(-5 * torch.abs(depth_gt - depth1.detach()) / (depth_gt + depth1.detach() + 1e-7))
+                    uncer2_gt = torch.exp(-5 * torch.abs(depth_gt - depth2.detach()) / (depth_gt + depth2.detach() + 1e-7))
 
-                # 2. 最终融合深度的 Loss
-                loss_depth_final = silog_criterion.forward(depth_final, depth_gt, mask)
 
-                # 3. 不确定性 Loss (原版逻辑)
-                uncer1_gt = torch.exp(-5 * torch.abs(depth_gt - depth1.detach()) / (depth_gt + depth1.detach() + 1e-7))
-                uncer2_gt = torch.exp(-5 * torch.abs(depth_gt - depth2.detach()) / (depth_gt + depth2.detach() + 1e-7))
-                loss_uncer1 = torch.abs(uncer1[mask] - uncer1_gt[mask]).mean()
-                loss_uncer2 = torch.abs(uncer2[mask] - uncer2_gt[mask]).mean()
+            else :
+                    loss_depth1 = silog_criterion.forward(depth1[0], depth_gt, mask)
+                    loss_depth2 = silog_criterion.forward(depth2[0], depth_gt, mask)
+                    uncer1_gt = torch.exp(-5 * torch.abs(depth_gt - depth1[0].detach()) / (depth_gt + depth1[0].detach() + 1e-7))
+                    uncer2_gt = torch.exp(-5 * torch.abs(depth_gt - depth2[0].detach()) / (depth_gt + depth2[0].detach() + 1e-7))
 
-                # 4. [新增] Gate Loss (监督 alpha)
-                # 这里的 depth1 和 depth2 需要 detach，防止 gate loss 影响 backbone
-                loss_gate = compute_gate_loss(depth2.detach(), depth1.detach(), depth_gt, alpha, mask)
+        
+            loss_uncer1 = torch.abs(u1[mask.to(torch.bool)]-uncer1_gt[mask.to(torch.bool)]).mean()
+            loss_uncer2 = torch.abs(u2[mask.to(torch.bool)]-uncer2_gt[mask.to(torch.bool)]).mean()
 
-                # 5. 法线和距离 Loss (原版逻辑)
-                normal_gt = torch.stack([normal_gt[:, 0], normal_gt[:, 2], normal_gt[:, 1]], 1)
-                normal_gt_norm = F.normalize(normal_gt, dim=1, p=2)
-                distance_gt = dn_to_distance(depth_gt, normal_gt_norm, inv_K_p)
-                loss_normal = 5 * ((1 - (normal_gt_norm * normal_est).sum(1, keepdim=True)) * mask.float()).sum() / (mask.float() + 1e-7).sum()
-                loss_distance = 0.25 * torch.abs(distance_gt[mask] - distance_est[mask]).mean()
+            
+            normal_gt = torch.stack([normal_gt[:, 0], normal_gt[:, 2], normal_gt[:, 1]], 1)
+            normal_gt_norm = F.normalize(normal_gt, dim=1, p=2)
+            loss_normal = 5 * ((1 - (normal_gt_norm * n1_norm).sum(1, keepdim=True)) * mask.float()).sum() / (mask.float() + 1e-7).sum()
+                
+            distance_gt = dn_to_distance(depth_gt, normal_gt_norm, inv_K_p)
+            loss_distance = 0.25 * torch.abs(distance_gt[mask] - distance[mask]).mean()
 
-                # 6. 平面平滑 Loss (原版逻辑)
-                segment, planar_mask, dissimilarity_map = compute_seg(image, normal_est, distance_est[:, 0])
-                loss_grad_normal, loss_grad_distance = get_smooth_ND(normal_est, distance_est, planar_mask)
+            mask_float = mask.float() # 显式转换
+            geom = geometry_losses(
+                n_unit=n1_norm,           # (B,3,H,W)
+                distance=distance,            # (B,1,H,W)
+                R=R, P=P_full,                         # (B,3,3), a(B,3,H,W)
+                z_pred=final_depth,               # (B,1,H,W)
+                z_plane=z_plane,                  # (B,1,H,W)
+                mask=mask_float,
+                w_align=1.0, w_plane_smooth=1.0, w_recon=1.0
+            )   
 
-                # 7. 总 Loss
-                # 权重可以微调，建议给 loss_gate 一个权重，例如 1.0
-                loss = (loss_depth_final + loss_depth1 + loss_depth2) + \
-                    loss_uncer1 + loss_uncer2 + \
-                    loss_normal + loss_distance + \
-                    0.01 * loss_grad_normal + 0.01 * loss_grad_distance + \
-                    1.0 * loss_gate
+            loss_geom = geom['L_geom_total']
+            if epoch < 5:
+                w_geom = 0.0
+            else:
+                start_epoch = 5
+                end_epoch = 20
+                # 确保不超出范围
+                progress = min(max((epoch - start_epoch) / (end_epoch - start_epoch), 0.0), 1.0)
+                w_geom = 0.1 + (1.0 - 0.1) * progress  # 从0.1线性增加到1.0
+                        # (min(epoch - 4, 3) / 3.0) * 1.0  # 0→1
 
-            # loss.backward()
+
+            loss_final = silog_criterion.forward(final_depth, depth_gt, mask)
+
+            loss = (  loss_depth1 + loss_depth2) + \
+                loss_uncer1 + loss_uncer2 +loss_normal+loss_distance+ \
+                w_geom*loss_geom+loss_final
+
             scaler.scale(loss).backward()
-
-            # nn.utils.clip_grad_norm_(model.parameters(), max_norm=10, norm_type=2)
-            # 梯度裁剪 (Unscale 之后再裁剪)
             scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=10, norm_type=2)
 
@@ -473,14 +613,12 @@ def main_worker(gpu, ngpus_per_node, args):
                 current_lr = (args.learning_rate - end_learning_rate) * (1 - global_step / num_total_steps) ** 0.9 + end_learning_rate
                 param_group['lr'] = current_lr
             
-            # optimizer.step()
             scaler.step(optimizer)
             scaler.update()
 
             if not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
                 if global_step % 10 == 0:
                     print('[epoch][s/s_per_e/gs]: [{}][{}/{}/{}], lr: {:.12f}, loss: {:.12f}'.format(epoch, step, steps_per_epoch, global_step, current_lr, loss))
-                #  print('[epoch][s/s_per_e/gs]: [{}][{}/{}/{}], lr: {:.12f}, loss: {:.12f}'.format(epoch, step, steps_per_epoch, global_step, current_lr, loss))
                 if np.isnan(loss.cpu().item()):
                     print('NaN in loss occurred. Aborting training.')
                     return -1
@@ -501,21 +639,21 @@ def main_worker(gpu, ngpus_per_node, args):
 
                 if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                                                             and args.rank % ngpus_per_node == 0):
-                    writer.add_scalar('silog_loss', (loss_depth_final + loss_depth1 + loss_depth2) , global_step)
+                    writer.add_scalar('loss', loss, global_step)
+
+                    writer.add_scalar('silog_loss', (  loss_depth1 + loss_depth2) , global_step)
                     writer.add_scalar('uncer_loss', (loss_uncer1 + loss_uncer2), global_step)
                     writer.add_scalar('normal_loss', loss_normal, global_step)
-                    writer.add_scalar('grad_normal_loss', loss_grad_normal, global_step)
                     writer.add_scalar('distance_loss', loss_distance, global_step)
-                    writer.add_scalar('grad_distance_loss', loss_grad_distance, global_step)
+
                     writer.add_scalar('learning_rate', current_lr, global_step)
                     writer.add_scalar('var average', var_sum.item()/var_cnt, global_step)
-                    writer.add_scalar('loss_gate', loss_gate, global_step)
-                    writer.add_scalar('loss_depth_final', loss_depth_final, global_step)
+                    writer.add_scalar('loss_geom', loss_geom, global_step)
                     
                 
                     writer.flush()
 
-            if args.do_online_eval and global_step and global_step % args.eval_freq == 0 and not model_just_loaded:
+            if args.do_online_eval and global_step and global_step % args.eval_freq == 0 and not model_just_loaded :
                 time.sleep(0.1)
                 model.eval()
                 with torch.no_grad():
@@ -528,7 +666,7 @@ def main_worker(gpu, ngpus_per_node, args):
                         txtfile.write(">>>>>>>>>>>>>>>>>>>>>>>>>Step:%d>>>>>>>>>>>>>>>>>>>>>>>>>\n"%(int(global_step)))
                         txtfile.write("{:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}\n".format('silog', 
                                         'abs_rel', 'log10', 'rms','sq_rel', 'log_rms', 'd1', 'd2','d3'))
-                        txtfile.write("depth estimation\n")
+                        # txtfile.write("depth estimation\n")
                         line = ''
                         for i in range(9):
                             line +='{:7.4f}, '.format(eval_measures[i])
@@ -569,6 +707,26 @@ def main_worker(gpu, ngpus_per_node, args):
                 block_print()
                 enable_print()
 
+                save_dir = os.path.join(args.log_directory, args.model_name, 'visual_debug')
+                visualize_p_full(image, P_full, save_dir, global_step)
+
+            if global_step and global_step % 20000 == 0:
+                # 定义保存名称，区别于“best”模型，使用“step”标识
+                model_save_name = '/model-{}-step.pth'.format(global_step)
+                print('Step {}. Periodic model saving: {}'.format(global_step, model_save_name))
+                
+                periodic_checkpoint = {
+                    'global_step': global_step,
+                    'model': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'best_eval_measures_higher_better': best_eval_measures_higher_better,
+                    'best_eval_measures_lower_better': best_eval_measures_lower_better,
+                    'best_eval_steps': best_eval_steps
+                }
+                
+                # 保存路径：log_directory/model_name/model-20000-step.pth
+                torch.save(periodic_checkpoint, args.log_directory + '/' + args.model_name + model_save_name)
+
             model_just_loaded = False
             global_step += 1
 
@@ -599,7 +757,11 @@ def main():
         aux_out_path = os.path.join(args.log_directory, args.model_name)
         networks_savepath = os.path.join(aux_out_path, 'networks')
         dataloaders_savepath = os.path.join(aux_out_path, 'dataloaders')
-        command = 'cp nddepth/train.py ' + aux_out_path
+        # command = 'cp nddepth/train.py ' + aux_out_path
+
+        current_script = sys.argv[0]  # 当前执行的脚本
+        script_name = os.path.basename(current_script)
+        command = f'cp {current_script} {os.path.join(aux_out_path, script_name)}'
         os.system(command)
         command = 'mkdir -p ' + networks_savepath + ' && cp nddepth/networks/*.py ' + networks_savepath
         os.system(command)

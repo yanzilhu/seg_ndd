@@ -18,5 +18,6 @@ debug_models/
 # 点云测试文件（ply/npy，不上传）
 *.ply
 *.npy
+*.log
 # TensorBoard日志文件（事件日志，不上传）
 events.out.tfevents.*

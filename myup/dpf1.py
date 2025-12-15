@@ -1,102 +1,498 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+训练代码:
+while epoch < args.num_epochs:
+
+        if args.distributed:
+            dataloader.train_sampler.set_epoch(epoch)
+        for step, sample_batched in enumerate(dataloader.data):
+            optimizer.zero_grad()
+
+            loss = 0
+
+            loss_depth1 = 0
+
+            loss_depth2 = 0
+            before_op_time = time.time()
+
+            image = torch.autograd.Variable(sample_batched['image'].cuda(args.gpu, non_blocking=True))
+
+            depth_gt = torch.autograd.Variable(sample_batched['depth'].cuda(args.gpu, non_blocking=True))
+            normal_gt = torch.autograd.Variable(sample_batched['normal'].cuda(args.gpu, non_blocking=True))
+
+            inv_K = torch.autograd.Variable(sample_batched['inv_K'].cuda(args.gpu, non_blocking=True))
+
+            inv_K_p = torch.autograd.Variable(sample_batched['inv_K_p'].cuda(args.gpu, non_blocking=True))
+
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                depth1, u1, depth2, u2, n1_norm, distance,final_depth,R,P_full,z_plane,_=model(image, inv_K, epoch)
+
+        
+                    mask = depth_gt > 0.1
+
+            
+                if epoch<5:
+
+                    loss_depth1 = silog_criterion.forward(depth1, depth_gt, mask)
+
+                    loss_depth2 = silog_criterion.forward(depth2, depth_gt, mask)
+
+                    uncer1_gt = torch.exp(-5 * torch.abs(depth_gt - depth1.detach()) / (depth_gt + depth1.detach() + 1e-7))
+
+                    uncer2_gt = torch.exp(-5 * torch.abs(depth_gt - depth2.detach()) / (depth_gt + depth2.detach() + 1e-7))
+
+                else :
+
+                    loss_depth1 = silog_criterion.forward(depth1[0], depth_gt, mask)
+
+                    loss_depth2 = silog_criterion.forward(depth2[0], depth_gt, mask)
+
+                    uncer1_gt = torch.exp(-5 * torch.abs(depth_gt - depth1[0].detach()) / (depth_gt + depth1[0].detach() + 1e-7))
+
+                    uncer2_gt = torch.exp(-5 * torch.abs(depth_gt - depth2[0].detach()) / (depth_gt + depth2[0].detach() + 1e-7))
+
+
+                loss_uncer1 = torch.abs(u1[mask.to(torch.bool)]-uncer1_gt[mask.to(torch.bool)]).mean()
+
+                loss_uncer2 = torch.abs(u2[mask.to(torch.bool)]-uncer2_gt[mask.to(torch.bool)]).mean()
+                loss_normal = 5 * ((1 - (normal_gt * n1_norm).sum(1, keepdim=True)) * mask.float()).sum() / (mask.float() + 1e-7).sum()
+
+            
+                normal_gt = torch.stack([normal_gt[:, 0], normal_gt[:, 2], normal_gt[:, 1]], 1)
+                normal_gt_norm = F.normalize(normal_gt, dim=1, p=2)
+                distance_gt = dn_to_distance(depth_gt, normal_gt_norm, inv_K_p)
+                loss_distance = 0.25 * torch.abs(distance_gt[mask] - distance[mask]).mean()
+
+                mask_float = mask.float() # 显式转换
+                geom = geometry_losses(
+                n_unit=n1_norm,           # (B,3,H,W)
+
+                distance=distance,            # (B,1,H,W)
+
+                R=R, P=P_full,                         # (B,3,3), a(B,3,H,W)
+
+                z_pred=final_depth,               # (B,1,H,W)
+
+                z_plane=z_plane,                  # (B,1,H,W)
+
+                mask=mask_float,
+
+                w_align=1.0, w_plane_smooth=1.0, w_recon=1.0
+
+            )   
+
+                loss_geom = geom['L_geom_total']
+
+                if epoch<5:
+
+                    loss = (  loss_depth1 + loss_depth2) +  loss_uncer1 + loss_uncer2 + loss_normal+loss_distance
+
+                else:
+
+                    loss = (  loss_depth1 + loss_depth2) + \
+
+                    loss_uncer1 + loss_uncer2 + \
+
+                    1.0*loss_geom+loss_normal+loss_distance
+
+
+
+            # loss.backward()
+
+            scaler.scale(loss).backward()
+
+            scaler.unscale_(optimizer)
+
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=10, norm_type=2
+
+其中class silog_loss(nn.Module):
+
+    def __init__(self, variance_focus):
+
+        super(silog_loss, self).__init__()
+
+        self.variance_focus = variance_focus
+
+
+
+    def forward(self, depth_est, depth_gt, mask):
+
+        d = torch.log(depth_est[mask]) - torch.log(depth_gt[mask])
+
+        return torch.sqrt((d ** 2).mean() - self.variance_focus * (d.mean() ** 2)) * 10.0
+
+
+
+def geometry_losses(
+
+    n_unit,                # (B,3,H,W)
+
+    distance,              # (B,1,H,W)
+
+    R, P,                  # (B,3,3), (B,K,H,W)
+
+    z_pred, z_plane,       # (B,1,H,W), (B,1,H,W)
+
+    mask=None,
+
+    w_align=1.0, w_plane_smooth=1.0, w_recon=1.0
+
+):
+
+    L_align = manhattan_alignment_loss(n_unit, R, P, mask)
+
+    L_plane  = plane_distance_smooth_var_loss(distance, P, mask)
+
+    L_recon  = plane_reconstruction_loss(z_pred, z_plane, mask)
+
+    L_total  = w_align * L_align + w_plane_smooth * L_plane + w_recon * L_recon
+
+    return {
+
+        'L_align': L_align,
+
+        'L_plane': L_plane,
+
+        'L_recon': L_recon,
+
+        'L_geom_total': L_total
+
+    }
+
+def manhattan_alignment_loss(n_unit, R, P, mask=None, eps=1e-6):
+
+    """
+
+    n_unit: (B,3,H,W) 已归一化法线（如 n1_norm）
+
+    R:      (B,3,3)   每图的Manhattan基（列为轴向）
+
+    P:      (B,3,H,W) 平面门控概率（例如[墙,地,顶]）
+
+    mask:   (B,1,H,W) 有效像素掩码（可为None）
+
+    目标：让法线在各自门控下贴近对应主轴（软分配）
+
+    L = sum_{i=1..3} mean( P_i * (1 - |n · axis_i|) )
+
+    """
+
+    B, _, H, W = n_unit.shape
+
+    axes = [R[:, :, 0], R[:, :, 1], R[:, :, 2]]  # 每个轴 (B,3)
+
+
+
+    loss = 0.0
+
+    denom = 0.0
+
+    for i in range(3):
+
+        ai = axes[i].view(B, 3, 1, 1).expand(-1, -1, H, W)  # (B,3,H,W)
+
+        cosi = torch.sum(n_unit * ai, dim=1, keepdim=True).abs()  # (B,1,H,W)
+
+        li = (1.0 - cosi).clamp(min=0.0) * P[:, i:i+1, :, :]      # (B,1,H,W)
+
+        if mask is not None:
+
+            li = li * mask
+
+            denom += mask.sum() + 1e-6
+
+        else:
+
+            denom += li.numel()
+
+        loss += li.sum()
+
+    return loss / (denom + eps)
+
+
+
+
+
+def plane_distance_smooth_var_loss(distance, P, mask=None, eps=1e-6):
+
+    """
+
+    distance: (B,1,H,W) 到原点距离（你模型的 distance_head 输出 * max_depth）
+
+    P:        (B,K,H,W) 平面门控（如K=3）
+
+    由两部分构成：
+
+      - TV平滑：sum_k mean( P_k * (|dx d| + |dy d|) )
+
+      - 区域方差：sum_k Var_{P_k}(distance)
+
+    """
+
+    B, _, H, W = distance.shape
+
+    K = P.shape[1]
+
+
+
+    dx = torch.abs(distance[:, :, :, 1:] - distance[:, :, :, :-1])
+
+    dy = torch.abs(distance[:, :, 1:, :] - distance[:, :, :-1, :])
+
+
+
+    tv = 0.0
+
+    tv_denom = 0.0
+
+    for k in range(K):
+
+        Pk = P[:, k:k+1, :, :]
+
+        if mask is not None:
+
+            Pk = Pk * mask
+
+
+
+        tvx = (Pk[:, :, :, 1:] * dx).sum()
+
+        tvy = (Pk[:, :, 1:, :] * dy).sum()
+
+        tv += tvx + tvy
+
+        tv_denom += (Pk[:, :, :, 1:]).sum() + (Pk[:, :, 1:, :]).sum() + eps
+
+
+
+    # 区域方差：对每个k，μ_k = sum(P_k * d)/sum(P_k)
+
+    var_loss = 0.0
+
+    for k in range(K):
+
+        Pk = P[:, k:k+1, :, :]
+
+        if mask is not None:
+
+            Pk = Pk * mask
+
+        wsum = Pk.sum() + eps
+
+        mu = (Pk * distance).sum() / wsum
+
+        var = ((Pk * (distance - mu)) ** 2).sum() / wsum
+
+        var_loss += var
+
+
+
+    tv_term = tv / (tv_denom + eps)
+
+    return tv_term + var_loss
+
+
+
+
+
+def plane_reconstruction_loss(z_pred, z_plane, mask=None, delta=0.1, eps=1e-6):
+
+    """
+
+    z_pred:  (B,1,H,W) 网络预测深度（可取两路的平均/最终细化输出）
+
+    z_plane: (B,1,H,W) DPF层拼回的平面深度
+
+    Huber(SmoothL1) 损失
+
+    """
+
+    diff = z_pred - z_plane
+
+    if mask is not None:
+
+        diff = diff * mask
+
+        denom = mask.sum() + eps
+
+    else:
+
+        denom = diff.numel()
+
+    abs_diff = diff.abs()
+
+    huber = torch.where(abs_diff < delta, 0.5 * (abs_diff ** 2) / delta, abs_diff - 0.5 * delta)
+
+    return huber.sum() / denom
+
+
+模型架构文件为：
 
 from .swin_transformer import SwinTransformer
 from .newcrf_layers import NewCRF
 from .uper_crf_head import PSP
 from utils import DN_to_depth
-########################################################################################################################
-# from .semantic_head import SemanticHead, PlaneGuidanceModule # [引用新增模块]
 
-# 升级方案：几何-纹理双流感知门控 (Geometry-Texture Aware Gating)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+# 曼哈顿
+class ManhattanBasisHead(nn.Module):
+    """
+    输入：e0（B, C, H, W）等高层特征
+    输出：R（B, 3, 3），表示每张图的Manhattan基（正交化，det>0）
+    """
+    def __init__(self, in_channels, hidden_dim=128):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, hidden_dim, kernel_size=3, padding=1)
+        self.act = nn.ReLU(inplace=True)
+        self.proj = nn.Conv2d(hidden_dim, 9, kernel_size=1, padding=0)  # 直接预测9个数
 
-class SobelLayer(nn.Module):
-    """
-    [新增模块] 纹理流感知器
-    使用固定权重的 Sobel 算子提取图像的高频纹理/边缘特征。
-    这比直接用 RGB 像素更能反映"结构复杂度"。
-    """
-    def __init__(self):
-        super(SobelLayer, self).__init__()
-        # 定义 Sobel 核 (检测水平和垂直边缘)
-        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3)
-        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3)
-        
-        # 扩展到 3 通道 (RGB)
-        self.register_buffer('sobel_x', sobel_x.repeat(1, 3, 1, 1) / 3.0) # 平均 RGB 通道
-        self.register_buffer('sobel_y', sobel_y.repeat(1, 3, 1, 1) / 3.0)
+    @staticmethod
+    def _gram_schmidt_orthonormalize(B):  # B: (B, 3, 3)
+        # 列向量正交化
+        u1 = B[:, :, 0]
+        e1 = F.normalize(u1, dim=1)
+
+        u2 = B[:, :, 1] - (torch.sum(B[:, :, 1] * e1, dim=1, keepdim=True) * e1)
+        e2 = F.normalize(u2 + 1e-8, dim=1)
+
+        u3 = B[:, :, 2] \
+             - (torch.sum(B[:, :, 2] * e1, dim=1, keepdim=True) * e1) \
+             - (torch.sum(B[:, :, 2] * e2, dim=1, keepdim=True) * e2)
+        e3 = F.normalize(u3 + 1e-8, dim=1)
+
+        R = torch.stack([e1, e2, e3], dim=2)  # (B,3,3)
+        # 保证det>0：若det<0则翻转第三列
+        det = torch.det(R)
+        flip = (det < 0).float().view(-1, 1)   # (B, 1)
+        e3_flipped = e3 * (1.0 - 2.0 * flip)
+        R = torch.stack([e1, e2, e3_flipped], dim=2)
+        return R
 
     def forward(self, x):
-        # x: [B, 3, H, W]
-        # 使用 group conv 对每个样本独立计算
-        grad_x = F.conv2d(x, self.sobel_x, padding=1, groups=1)
-        grad_y = F.conv2d(x, self.sobel_y, padding=1, groups=1)
-        # 计算梯度幅值
-        magnitude = torch.sqrt(grad_x**2 + grad_y**2 + 1e-6)
-        # 归一化到 0~1，方便网络处理
-        return magnitude / (magnitude.max() + 1e-6)
-
-class PAGFusion(nn.Module):
+        # x: (B,C,H,W)
+        h = self.act(self.conv(x))
+        b, c, hH, hW = h.shape
+        # GAP到 (B, hidden, 1, 1) -> (B, 9)
+        g = F.adaptive_avg_pool2d(h, 1)
+        nine = self.proj(g).view(b, 9)
+        Bmat = nine.view(b, 3, 3)
+        R = self._gram_schmidt_orthonormalize(Bmat)
+        return R  # (B,3,3)
+# 平面门控
+class PlaneGateHead(nn.Module):
     """
-    [核心创新] 物理感知门控融合 (Physics-Aware Gating Fusion)
-    输入分为两流：
-    1. 几何流 (Geometry Stream): 几何残差, 不确定性, 深度值
-    2. 纹理流 (Texture Stream): 图像梯度, 上下文特征
+    输入：e0（B, C, H, W）
+    输出：P（B, K, H, W），例如K=3分别表示{墙, 地, 顶}的软门控概率（softmax）
     """
-    def __init__(self, context_channels, hidden_dim=64):
-        super(PAGFusion, self).__init__()
-        
-        # 1. 几何流特征处理
-        # 输入: d_geo, d_pix, diff_norm, u_geo, u_pix (共5通道)
-        self.geo_branch = nn.Sequential(
-            nn.Conv2d(5, hidden_dim // 2, kernel_size=3, padding=1),
-            nn.BatchNorm2d(hidden_dim // 2),
-            nn.ReLU(inplace=True)
-        )
-        
-        # 2. 纹理流特征处理
-        # 输入: context_feat (128) + img_grad (1) = 129
-        self.tex_branch = nn.Sequential(
-            nn.Conv2d(context_channels + 1, hidden_dim // 2, kernel_size=3, padding=1),
-            nn.BatchNorm2d(hidden_dim // 2),
-            nn.ReLU(inplace=True)
-        )
-        
-        # 3. 融合决策层 (轻量级)
-        self.fusion_conv = nn.Sequential(
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.BatchNorm2d(hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_dim, 1, kernel_size=1) # 输出 Logits
-        )
+    def __init__(self, in_channels, num_planes=3):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, in_channels, 3, padding=1)
+        self.act = nn.ReLU(inplace=True)
+        self.proj = nn.Conv2d(in_channels, num_planes, 1)
 
-    def forward(self, d_geo, d_pix, diff_norm, u_geo, u_pix, context_feat, img_grad):
+    def forward(self, x):
+        h = self.act(self.conv1(x))
+        logits = self.proj(h)             # (B,K,H,W)
+        P = torch.softmax(logits, dim=1)  # 通道维softmax
+        return P
+
+# DPF可微笑（可微局部平面拟合 + 平面深度重建）
+# 给定深度图 z、相机内参逆 inv_K 与K个区域权重 W（软掩码），先把 z 回投为点云，
+# 再对每个区域做加权SVD/特征分解拟合平面 (n_k, d_k)，最后把各平面拼回像素层的平面深度 z_plane（用区域权重做软选择，保持可微）。
+class DPFLayer(nn.Module):
+    def __init__(self, tau=20.0, eps=1e-6, min_region_area=20):
+        super().__init__()
+        self.tau = tau
+        self.eps = eps
+        self.min_region_area = min_region_area
+
+    @staticmethod
+    def _make_rays(inv_K, H, W, device, dtype=torch.float32):
+        # pixel homogeneous coords (3,H,W)
+        ys, xs = torch.meshgrid(
+            torch.arange(0, H, device=device),
+            torch.arange(0, W, device=device),
+            indexing='ij'
+        )
+        ones = torch.ones_like(xs, dtype=dtype, device=device)
+        pix = torch.stack([xs.to(dtype=dtype), ys.to(dtype=dtype), ones], dim=0)  # (3,H,W)
+        pix = pix.unsqueeze(0).expand(inv_K.shape[0], -1, -1, -1)  # (B,3,H,W)
+
+        # inv_K: (B,3,3) ; rays = inv_K @ pix
+        # use einsum with correct subscripts
+        rays = torch.einsum('bij,bjhw->bihw', inv_K.to(dtype=dtype), pix)  # (B,3,H,W)
+        rays = F.normalize(rays, dim=1)
+        return rays
+
+    def forward(self, depth_map, inv_K, region_w):
         """
-        所有输入需要预先插值到相同分辨率 (通常是 1/4 尺度)
+        depth_map: (B,1,H,W) - may be float16 from autocast; we'll compute in float32
+        inv_K:     (B,3,3)
+        region_w:  (B,K,H,W) soft-weights
         """
-        # --- 几何流 ---
-        geo_in = torch.cat([d_geo, d_pix, diff_norm, u_geo, u_pix], dim=1)
-        geo_feat = self.geo_branch(geo_in)
-        
-        # --- 纹理流 ---
-        tex_in = torch.cat([context_feat, img_grad], dim=1)
-        tex_feat = self.tex_branch(tex_in)
-        
-        # --- 融合决策 ---
-        # 拼接两流特征
-        feat_cat = torch.cat([geo_feat, tex_feat], dim=1)
-        
-        # 输出 Logits (不加 Sigmoid，配合 BCEWithLogitsLoss 使用)
-        gate_logits = self.fusion_conv(feat_cat)
-        
-        return gate_logits
+        with torch.cuda.amp.autocast(enabled=False):
+            B, _, H, W = depth_map.shape
+            K = region_w.shape[1]
+            device = depth_map.device
 
+            # compute rays and X in float32 for numerical stability
+            inv_K = inv_K[:, :3, :3]
+            invK_f32 = inv_K.to(device=device).to(torch.float32)
+            depth_f32 = depth_map.to(torch.float32)
+            rays = self._make_rays(invK_f32, H, W, device, dtype=torch.float32)  # (B,3,H,W)
+            X = rays * depth_f32  # (B,3,H,W)
 
+            # normalize region weights per region
+            w = region_w.clamp(min=0.0).to(torch.float32) + self.eps  # (B,K,H,W)
+            w_sum = torch.sum(w, dim=(2, 3), keepdim=True) + self.eps     # (B,K,1,1)
+            w_norm = w / w_sum
 
+            # optionally zero-out regions that are too small (avoid degenerate cov)
+            area = torch.sum((region_w > 0.01).to(torch.float32), dim=(2,3))  # (B,K)
+            small_region_mask = (area < float(self.min_region_area)).unsqueeze(-1).unsqueeze(-1)  # (B,K,1,1)
+            w_norm = torch.where(small_region_mask, torch.zeros_like(w_norm), w_norm)
+
+            # weighted centroid mu_k
+            X_flat = X.view(B, 3, -1)                         # (B,3,N)
+            w_flat = w_norm.view(B, K, -1)                    # (B,K,N)
+            mu = torch.einsum('bkn,bcn->bkc', w_flat, X_flat)  # (B,K,3)
+
+            # weighted covariance
+            X_exp = X_flat.unsqueeze(1).expand(B, K, 3, H*W)   # (B,K,3,N)
+            mu_exp = mu.unsqueeze(-1)                         # (B,K,3,1)
+            Xm = X_exp - mu_exp                               # (B,K,3,N)
+            wN = w_flat.unsqueeze(2)                          # (B,K,1,N)
+            Xm_w = Xm * wN                                    # (B,K,3,N)
+            cov = torch.einsum('bkcn,bkdn->bkcd', Xm_w, Xm)   # (B,K,3,3)
+            cov = 0.5 * (cov + cov.transpose(-1, -2))         # symmetrize
+
+            cov = cov + torch.eye(3).to(cov.device) * 1e-6
+            # eigen-decomp (float32). torch.linalg.eigh is differentiable.
+            eigvals, eigvecs = torch.linalg.eigh(cov)         # eigvals:(B,K,3), eigvecs:(B,K,3,3)
+            n = eigvecs[..., 0]                               # smallest-eigvec => normal (B,K,3)
+            n = F.normalize(n, dim=-1)
+
+            # canonicalize direction so that n_z >= 0 (camera forward z)
+            sign = torch.where(n[..., 2:3] < 0, -1.0, 1.0)
+            n = n * sign
+
+            # d = - n^T mu
+            d = -torch.sum(n * mu, dim=-1, keepdim=True)     # (B,K,1)
+
+            # denom = n · rays  -> (B,K,H,W)
+            denom = torch.einsum('bkc,bchw->bkhw', n, rays)  # (B,K,H,W)
+            denom = denom.clamp(min=1e-3)  # avoid division-by-zero / huge values
+
+            z_k_map = -d.unsqueeze(-1) / denom  # (B,K,H,W) broadcast -> ensure shapes OK
+            # numerical guard: remove non-finite
+            z_k_map = torch.where(torch.isfinite(z_k_map), z_k_map, torch.zeros_like(z_k_map))
+
+            # soft selection via region_w with temperature
+            gate = torch.softmax(self.tau * w, dim=1)        # (B,K,H,W)
+            z_plane = torch.sum(gate * z_k_map, dim=1, keepdim=True)  # (B,1,H,W)
+
+        # return as float32 (the caller can clamp/cast to original dtype)
+        return n, d, z_plane, z_k_map
 
 class NewCRFDepth(nn.Module):
     """
@@ -198,24 +594,22 @@ class NewCRFDepth(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Conv2d(64, 16*9, 1, padding=0))
             
-        # self.update = BasicUpdateBlockDepth()
-        # [新增] 自适应门控网络
-        # context feature (feats[0]) channels usually is crf_dims[0] (e.g., 128)
-        # input channels = 128 (context) + 5 (d1, d2, diff, u1, u2) = 133
-
-        # self.gate_net = AdaptiveGatingNetwork(in_c——hannels=192 + 5, hidden_dim=64)
-        self.sobel = SobelLayer()
-        # [新增] 2. 物理感知门控 (替代原来的 self.gate_net)
-        # context_channels 通常是 backbone 输出的第一层通道数，swin-large 是 192，base 是 128
-        # 请根据你的 crf_dims[0] 实际值修改，这里假设是 crf_dims[0]
-        self.gate_net = PAGFusion(context_channels=192, hidden_dim=64)
-        
-        # [移除] 旧的 update 模块
-        # self.update = BasicUpdateBlockDepth()
-        # ------------------ 修改结束 ------------------
         self.min_depth = min_depth
         self.max_depth = max_depth
+
+        self.up_mode = 'bilinear'
+        if self.up_mode == 'mask':
+            self.mask_head2 = nn.Sequential(
+                nn.Conv2d(crf_dims[0], 64, 3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(64, 16*9, 1, padding=0))
+            
+        self.update = BasicUpdateBlockDepth()
         
+        self.manhattan_head = ManhattanBasisHead(in_channels=5)
+        self.plane_gate     = PlaneGateHead(in_channels=5, num_planes=3)  # [墙, 地, 顶]
+        self.dpf_layer      = DPFLayer(tau=20.0)
+
                 
         self.init_weights(pretrained=pretrained)
 
@@ -257,11 +651,8 @@ class NewCRFDepth(nn.Module):
         up_disp = up_disp.permute(0, 1, 4, 2, 5, 3)
         return up_disp.reshape(N, 1, 4*H, 4*W)
 
-    def forward(self, imgs, inv_K, epoch):
-        img_grad_full = self.sobel(imgs) # [B, 1, H, W]
-        
+    def forward(self, imgs, inv_K, epoch):        
         feats = self.backbone(imgs)
-
         if self.with_neck:
             feats = self.neck(feats)
         
@@ -317,64 +708,69 @@ class NewCRFDepth(nn.Module):
         distance = dist1 * self.max_depth 
         n1_norm = F.normalize(n1, dim=1, p=2)
         depth2 = dn_to_depth(n1_norm, distance, inv_K).clamp(0, self.max_depth)
+
+        if epoch < 5:
+            depth1 = upsample(d1, scale_factor=4) * self.max_depth
+            u1 = upsample(u1, scale_factor=4)
+            depth2 = upsample(depth2, scale_factor=4)
+            u2 = upsample(u2, scale_factor=4)
+            n1_norm = upsample(n1_norm, scale_factor=4)
+            distance = upsample(distance, scale_factor=4)
+
+            eps = 1e-6
+            # u1/u2 期望和 uncer_gt 同分布 (较大 -> 更可信)
+            w1 = u1.clamp(min=eps)
+            w2 = u2.clamp(min=eps)
+            final_depth = (w1 * depth1 + w2 * depth2) / (w1 + w2 + eps)
+
+            geo_in = torch.cat([n1_norm, distance, final_depth], dim=1)
+            # ---- 计算 R / P / DPF 拼回平面深度 ----
+            R = self.manhattan_head(geo_in)                       # (B,3,3)
+            P = self.plane_gate(geo_in)                           # (B,3,h,w) (与 geo_in 同分辨率)
+            # 若 geo_in 分辨率 < depth 分辨率，可在此上采样，这里二者一致无需上采样
+            P_full = P
+
+            # n_k, d_k, z_plane, z_k_map = self.dpf_layer(final_depth, inv_K, P_full)
+            _, _, z_plane, z_k_map = self.dpf_layer(final_depth, inv_K, P_full) 
+
+            return depth1, u1, depth2, u2, n1_norm, distance,final_depth,R,P_full,z_plane,z_k_map
         
-
-        # ------------------ 修改开始：融合逻辑 ------------------
-        # 统一分辨率到 1/4 (feats[0] 的尺寸) 用于计算 Gate
-        # d1, u1, u2 已经是 1/4 分辨率 (如果 up_mode 不是 mask)
-        # 如果 up_mode 是 mask，它们可能是全分辨率，需要下采样回去，或者我们在 mask head 之前截取
-        # 这里假设 d1, u1 是通过 disp_head1 输出的，通常是 1/4 尺寸
-        # 确保所有特征尺寸一致 (B, C, H/4, W/4)
-        # depth2 需要插值到 1/4 (因为 dn_to_depth 输出是全分辨率或者跟输入一致)
-        # 检查 dn_to_depth 的输出尺寸，如果是全图尺寸，则 downsample
-        if depth2.shape[-1] != d1.shape[-1]:
-             depth2_low = F.interpolate(depth2, size=d1.shape[-2:], mode='bilinear', align_corners=False)
         else:
-             depth2_low = depth2
+            depth1 = d1
+            depth2 = depth2 / self.max_depth
+            context = feats[0]
+            gru_hidden = torch.cat((e0, e4), 1)
+            depth1_list, depth2_list  = self.update(depth1, u1, depth2, u2, context, gru_hidden)
 
-        target_h, target_w = d1.shape[-2:]
-        d1_metric = d1 * self.max_depth
-        # 2. 纹理梯度下采样 (从 H,W -> H/4, W/4)
-        img_grad_low = F.interpolate(img_grad_full, size=(target_h, target_w), mode='bilinear', align_corners=False)
-        # 3. 计算归一化几何残差 (核心特征)
-        # 加上 1e-3 防止除零，且让网络关注相对误差
-        diff_norm = torch.abs(d1_metric - depth2_low) / (d1_metric + 1e-3)
-        # 4. 准备上下文特征
-        context_feat = feats[0] # [B, C, H/4, W/4]
+            for i in range(len(depth1_list)):
+                depth1_list[i] = upsample(depth1_list[i], scale_factor=4) * self.max_depth
+            u1 = upsample(u1, scale_factor=4)
+            for i in range(len(depth2_list)):
+                depth2_list[i] = upsample(depth2_list[i], scale_factor=4) * self.max_depth 
+            u2 = upsample(u2, scale_factor=4)
+            n1_norm = upsample(n1_norm, scale_factor=4)
+            distance = upsample(distance, scale_factor=4)
 
-        # ------------------ 修改：调用 PAG-Fusion ------------------
-        # 输入：几何流 + 纹理流
-        gate_logits = self.gate_net(
-            d_geo=depth2_low, 
-            d_pix=d1_metric, 
-            diff_norm=diff_norm, 
-            u_geo=u2,           # 注意对应关系: u2是几何头的不确定性
-            u_pix=u1,           # u1是像素头的不确定性
-            context_feat=context_feat, 
-            img_grad=img_grad_low
-        )
-        # 计算融合权重 (用于 Inference)
-        alpha = torch.sigmoid(gate_logits)
-        # 执行融合
-        depth_fused_low = alpha * depth2_low + (1 - alpha) * d1_metric
+            eps = 1e-6
+            # u1/u2 期望和 uncer_gt 同分布 (较大 -> 更可信)
+            w1 = u1.clamp(min=eps)
+            w2 = u2.clamp(min=eps)
+            final_depth = (w1 * depth1_list[-1] + w2 * depth2_list[-1]) / (w1 + w2 + eps)
 
-        # 上采样回全分辨率
-        depth_final = upsample(depth_fused_low, scale_factor=4)
-        # 为了计算 Loss 和可视化，把 logits 也上采样
-        gate_logits_full = upsample(gate_logits, scale_factor=4)
-       
-        # 处理其他输出用于监督
-        depth1_out = upsample(d1, scale_factor=4) * self.max_depth
-        depth2_out = upsample(depth2_low, scale_factor=4) # depth2 原本可能是全分辨率，但为了统一处理逻辑
-        u1_out = upsample(u1, scale_factor=4)
-        u2_out = upsample(u2, scale_factor=4)
-        n1_out = upsample(n1_norm, scale_factor=4)
-        distance_out = upsample(distance, scale_factor=4)
+            geo_in = torch.cat([n1_norm, distance, final_depth], dim=1)
+            # ---- 计算 R / P / DPF 拼回平面深度 ----
+            R = self.manhattan_head(geo_in)                       # (B,3,3)
+            P = self.plane_gate(geo_in)                           # (B,3,h,w) (与 geo_in 同分辨率)
+            # 若 geo_in 分辨率 < depth 分辨率，可在此上采样，这里二者一致无需上采样
+            P_full = P
 
-        return depth_final, gate_logits_full, depth1_out, u1_out, depth2_out, u2_out, n1_out, distance_out
-        # # ------------------ 修改结束 ------------------
+            # n_k, d_k, z_plane, z_k_map = self.dpf_layer(final_depth, inv_K, P_full) 
+            _, _, z_plane, z_k_map = self.dpf_layer(final_depth, inv_K, P_full) 
 
 
+            return depth1_list, u1, depth2_list, u2, n1_norm, distance, final_depth,R,P_full,z_plane,z_k_map                    
+        
+    
 
       
                     
@@ -707,35 +1103,3 @@ def upsample(x, scale_factor=2, mode="bilinear", align_corners=False):
     """Upsample input tensor by a factor of 2
     """
     return F.interpolate(x, scale_factor=scale_factor, mode=mode, align_corners=align_corners)
-
-
-
-# my 
-class AdaptiveGatingNetwork(nn.Module):
-    """
-    轻量级自适应门控网络
-    输入: 几何深度, 像素深度, 几何残差, 两个不确定性图, 图像上下文特征
-    输出: 融合权重 alpha (0~1)
-    """
-    def __init__(self, in_channels, hidden_dim=64):
-        super(AdaptiveGatingNetwork, self).__init__()
-        # 输入通道 = 1(d_geo) + 1(d_pixel) + 1(diff) + 1(u_geo) + 1(u_pixel) + context_dim
-        self.conv1 = nn.Conv2d(in_channels, hidden_dim, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(hidden_dim)
-        self.conv2 = nn.Conv2d(hidden_dim, hidden_dim // 2, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(hidden_dim // 2)
-        self.conv3 = nn.Conv2d(hidden_dim // 2, 1, kernel_size=1) # 输出单通道权重
-        self.sigmoid = nn.Sigmoid()
-        self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, d_geo, d_pixel, diff, u_geo, u_pixel, feat):
-        # 拼接所有特征 [B, C_total, H, W]
-        # 注意：这里假设所有输入已经是相同分辨率（通常是 1/4 分辨率）
-        x = torch.cat([d_geo, d_pixel, diff, u_geo, u_pixel, feat], dim=1)
-        
-        x = self.relu(self.bn1(self.conv1(x)))
-        x = self.relu(self.bn2(self.conv2(x)))
-        alpha = self.sigmoid(self.conv3(x))
-        logits = self.conv3(x)
-        return logits
-        # return alpha
