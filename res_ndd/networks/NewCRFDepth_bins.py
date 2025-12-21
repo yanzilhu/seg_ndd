@@ -7,83 +7,162 @@ from .newcrf_layers import NewCRF
 from .uper_crf_head import PSP
 from utils import DN_to_depth
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-# -------------------------------------------------------------------------
-# 0. 辅助模块
-# -------------------------------------------------------------------------
+# # --- 辅助函数 ---
+# def upsample(x, scale_factor=2, mode="bilinear", align_corners=False):
+#     return F.interpolate(x, scale_factor=scale_factor, mode=mode, align_corners=align_corners)
 
-class PlanarFusionModule(nn.Module):
-    def __init__(self, in_channels):
-        super(PlanarFusionModule, self).__init__()
-        # 输入: [Feat_ND(C) + Feat_Reg(C) + Depth_Geo(1) + Depth_Reg(1) + Uncer_ND(1) + Uncer_Reg(1)]
-        fusion_dim = in_channels * 2 + 4 
+# --- 创新模块 1: 几何引导的 Prompt Bin Layer ---
+class GeometryGuidedPromptBinLayer(nn.Module):
+    def __init__(self, in_channels, n_bins=64, hidden_dim=128):
+        super().__init__()
+        self.n_bins = n_bins
+        # 提示参数 Rpar (Learnable Embedding) [Hidden, 1, 1]
+        self.prompt_embedding = nn.Parameter(torch.randn(hidden_dim, 1, 1)) 
         
-        self.conv1 = nn.Conv2d(fusion_dim, 64, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.relu = nn.ReLU(inplace=True)
-        
-        self.conv2 = nn.Conv2d(64, 2, kernel_size=3, padding=1) # 输出两个权重 map
-        self.softmax = nn.Softmax(dim=1) # 保证权重和为1
-
-        # 为两个特征分支分别定义 BN 和 ReLU
-        self.process_nd = nn.Sequential(
-            nn.BatchNorm2d(in_channels),
+        # 特征变换层
+        self.conv_embed = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_dim, 1),
+            nn.BatchNorm2d(hidden_dim),
             nn.ReLU(inplace=True)
         )
-        self.process_reg = nn.Sequential(
-            nn.BatchNorm2d(in_channels),
+        
+        # --- 创新点：法线注入层 ---
+        # 将几何分支传来的法线特征融合进 Prompt 交互中
+        self.normal_fusion = nn.Sequential(
+            nn.Conv2d(3, hidden_dim, 1), # 假设输入法线图是3通道
             nn.ReLU(inplace=True)
         )
+        self.attention = nn.Sequential(
+            nn.Conv2d(hidden_dim * 2, hidden_dim, 1),
+            nn.Sigmoid()
+        )
 
-    def forward(self, depth_geo, depth_reg, uncer_nd, uncer_reg, feat_nd, feat_reg):
+        # 预测 Bin 宽度的头
+        self.bin_width_head = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, n_bins, 1),
+            nn.Softmax(dim=1) 
+        )
+        
+        # 预测 Bin 概率的头 (分类)
+        self.bin_prob_head = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, n_bins, 1),
+            nn.Softmax(dim=1)
+        )
+
+    def forward(self, x, normal_feat, min_depth, max_depth):
         """
-        depth_geo, depth_reg: [B, 1, H, W]
-        uncer_nd, uncer_reg: [B, 1, H, W]
-        feat_nd, feat_reg: [B, 128, H/4, W/4] 
+        x: 解码器特征 [B, C, H, W]
+        normal_feat: 几何分支预测的法线图 [B, 3, H, W]
         """
-        # 1. 特征对齐 (如果 feature 还是 H/4, W/4，需要上采样)
-        feat_nd = upsample(feat_nd, scale_factor=4)
-        feat_reg=upsample(feat_reg, scale_factor=4)
+        # 1. 基础特征处理
+        feat = self.conv_embed(x) 
         
-        feat_nd = self.process_nd(feat_nd)
-        feat_reg = self.process_reg(feat_reg)
+        # 2. --- 几何引导交互 (Geometry Guidance) ---
+        # 让 Prompt 不仅看纹理，还看法线
+        norm_feat = self.normal_fusion(normal_feat)
+        
+        # Prompt 注入 (Broadcasting)
+        prompt = self.prompt_embedding 
+        
+        # 注意力机制：根据法线调整 Prompt 对特征的激活程度
+        # 逻辑：如果法线显示是平坦区域，Prompt 应该更关注某种分布
+        attn_map = self.attention(torch.cat([feat, norm_feat], dim=1))
+        feat_activated = feat * prompt * attn_map + feat # 残差连接
+        
+        # 3. 预测 Bin 宽度 & 概率
+        bin_widths_norm = self.bin_width_head(feat_activated) # [B, N, H, W] (归一化宽度)
+        bin_probs = self.bin_prob_head(feat_activated)        # [B, N, H, W]
+        
+        # 4. 计算 Bin 中心 (Centers)
+        # 将归一化宽度转换为实际深度范围
+        bin_widths = (max_depth - min_depth) * bin_widths_norm 
+        bin_widths = F.pad(bin_widths, (0, 0, 0, 0, 1, 0), mode='constant', value=min_depth)
+        bin_edges = torch.cumsum(bin_widths, dim=1)
+        bin_centers = 0.5 * (bin_edges[:, :-1] + bin_edges[:, 1:]) # [B, N, H, W]
+        
+        # 5. 软回归计算深度 (Soft Geometry Depth)
+        depth_bins = torch.sum(bin_centers * bin_probs, dim=1, keepdim=True)
+        
+        return depth_bins, bin_probs
 
-        # 2. 拼接所有信息
-
-        cat_feat = torch.cat([feat_nd, feat_reg, depth_geo, depth_reg, uncer_nd, uncer_reg], dim=1)
-        
-        # 3. 计算融合权重
-        x = self.relu(self.bn1(self.conv1(cat_feat)))
-        weights = self.softmax(self.conv2(x)) # [B, 2, H, W]
-        
-        w_geo = weights[:, 0:1, :, :]
-        w_reg = weights[:, 1:2, :, :]
-        
-        # 4. 加权融合
-        depth_final = w_geo * depth_geo + w_reg * depth_reg
-        
-        return depth_final, w_geo # 返回权重用于可视化分析
-class OffsetHead(nn.Module):
-    def __init__(self, input_dim=128):
-        super(OffsetHead, self).__init__()
-        # 预测 x 和 y 方向的偏移量
-        self.conv1 = nn.Conv2d(input_dim, 128, 3, padding=1)
+# --- 创新模块 2: 分布约束的 Offset Head ---
+class DistributionGuidedOffsetHead(nn.Module):
+    def __init__(self, input_dim=128, n_bins=64):
+        super().__init__()
+        # 输入不仅是图像特征，还有 Bin 的概率分布向量
+        self.conv1 = nn.Conv2d(input_dim + n_bins, 128, 3, padding=1)
         self.bn1 = nn.BatchNorm2d(128)
         self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(128, 2, 3, padding=1) # 输出 2 通道 (delta_x, delta_y)
+        self.conv2 = nn.Conv2d(128, 2, 3, padding=1) # Delta X, Delta Y
         
-        # 初始化：让初始偏移量接近 0，保证训练初期网络先学好局部特征
         nn.init.normal_(self.conv2.weight, mean=0, std=0.001)
         nn.init.constant_(self.conv2.bias, 0)
 
-    def forward(self, x, scale):
-        x = self.relu(self.bn1(self.conv1(x)))
+    def forward(self, x, bin_probs, scale):
+        """
+        x: 图像特征 [B, C, H, W]
+        bin_probs: Prompt 分支输出的概率分布 [B, N_bins, H, W]
+        """
+        # 拼接特征与分布
+        cat_feat = torch.cat([x, bin_probs], dim=1)
+        
+        x = self.relu(self.bn1(self.conv1(cat_feat)))
         offset = self.conv2(x)
+        
         if scale > 1:
              offset = F.interpolate(offset, scale_factor=scale, mode='bilinear', align_corners=True)
         return offset
+
+# --- 创新模块 3: 平面度感知的融合模块 ---
+class PlanarityAwareFusion(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # 这是一个纯物理/概率计算模块，无参数，或者极少参数
+        # 也可以加入一个简单的门控网络来学习
+        self.gate_net = nn.Sequential(
+            nn.Conv2d(4, 32, 3, padding=1), # 输入: Uncertainty_Geo, Uncertainty_Bin, Planarity, 1
+            nn.ReLU(),
+            nn.Conv2d(32, 1, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, d_geo, d_bins, u_geo, u_bins, normal_map):
+        """
+        d_geo: 硬几何深度 (NDDepth)
+        d_bins: 软几何深度 (Prompt Bins)
+        u_geo, u_bins: 不确定性
+        normal_map: 预测的法线图
+        """
+        # 1. 计算平面度 (Planarity)
+        # 利用法线图的局部梯度来判断：法线变化小 -> 平面 -> 信任 d_geo
+        # 利用 Sobel 算子或简单差分
+        ny, nx = torch.gradient(normal_map, dim=(2, 3))
+        planarity = 1.0 - torch.tanh(torch.abs(nx) + torch.abs(ny)).mean(dim=1, keepdim=True) # 1=完全平, 0=边缘
+        
+        # 2. 基础方差加权
+        eps = 1e-6
+        w_geo_var = 1.0 / (u_geo + eps)
+        w_bins_var = 1.0 / (u_bins + eps)
+        
+        # 3. 结合平面度进行门控调整
+        # 如果是平面(planarity->1)，强行提升 Geo 的权重
+        # 如果是复杂区域(planarity->0)，强行提升 Bins 的权重
+        
+        # 简单融合策略: 
+        # W_geo = w_geo_var * (1 + planarity)
+        # W_bins = w_bins_var * (1 + (1-planarity))
+        
+        # 或者使用学习的 Gate
+        gate_input = torch.cat([u_geo, u_bins, planarity, d_geo*0+1], dim=1) # placeholder
+        alpha = self.gate_net(gate_input) # alpha 倾向于 1 则选 Geo
+        
+        d_final = alpha * d_geo + (1 - alpha) * d_bins
+        
+        return d_final, planarity, alpha
 
 def sample_with_offset(map_to_sample, offset):
     """
@@ -180,52 +259,26 @@ class NewCRFDepth(nn.Module):
         crf_dims = [128, 256, 512, 1024]
         v_dims = [64, 128, 256, embed_dim]
         
-        # --------
-        # depth
-        self.crf3 = NewCRF(input_dim=in_channels[3], embed_dim=crf_dims[3], window_size=win, v_dim=v_dims[3], num_heads=32)
-        self.crf2 = NewCRF(input_dim=in_channels[2], embed_dim=crf_dims[2], window_size=win, v_dim=v_dims[2], num_heads=16)
-        self.crf1 = NewCRF(input_dim=in_channels[1], embed_dim=crf_dims[1], window_size=win, v_dim=v_dims[1], num_heads=8)
-        self.crf0 = NewCRF(input_dim=in_channels[0], embed_dim=crf_dims[0], window_size=win, v_dim=v_dims[0], num_heads=4)
-
-        self.decoder = PSP(**decoder_cfg)
-        self.disp_head1 = DispHead(input_dim=crf_dims[0])
-        self.uncer_head1 = UncerHead1(input_dim=crf_dims[0])
 
         self.up_mode = 'bilinear'
-        if self.up_mode == 'mask':
-            self.mask_head = nn.Sequential(
-                nn.Conv2d(crf_dims[0], 64, 3, padding=1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(64, 16*9, 1, padding=0))
+
+        # 2. 共享解码器 (Shared Decoder) - 负责提取通用特征
+        # 这里为了简化，我们假设它处理 Swin 的输出并融合到 1/4 分辨率
+        embed_dim = 512
+        decoder_channels = [128, 256, 512, 1024] # 假设值
+        self.decoder_dims = 128 # 最终共享特征的维度
+
         
-        # normal and distance
-        self.crf7 = NewCRF(input_dim=in_channels[3], embed_dim=crf_dims[3], window_size=win, v_dim=v_dims[3], num_heads=32)
-        self.crf6 = NewCRF(input_dim=in_channels[2], embed_dim=crf_dims[2], window_size=win, v_dim=v_dims[2], num_heads=16)
-        self.crf5 = NewCRF(input_dim=in_channels[1], embed_dim=crf_dims[1], window_size=win, v_dim=v_dims[1], num_heads=8)
-        self.crf4 = NewCRF(input_dim=in_channels[0], embed_dim=crf_dims[0], window_size=win, v_dim=v_dims[0], num_heads=4)
-        self.decoder_geo = PSP(**decoder_cfg)
-        self.decoder2 = PSP(**decoder_cfg)
 
-        self.normal_head1 = NormalHead(input_dim=crf_dims[0])
-        self.distance_head1 = DistanceHead(input_dim=crf_dims[0])
-        self.uncer_head2 = UncerHead2(input_dim=crf_dims[0])
-
-        self.up_mode = 'bilinear'
-        if self.up_mode == 'mask':
-            self.mask_head2 = nn.Sequential(
-                nn.Conv2d(crf_dims[0], 64, 3, padding=1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(64, 16*9, 1, padding=0))
+        # 这里你可以复用之前的 NewCRF 或 PSP 模块作为 Shared Decoder
+        # 假设我们得到了一个特征图 shared_feat [B, 128, H/4, W/4]
+        # 为了代码演示，我定义一个简单的融合层代替复杂的 CRF Decoder
+        self.shared_decoder = nn.Conv2d(sum(decoder_channels), 128, 1) # 示意代码
             
         self.min_depth = min_depth
         self.max_depth = max_depth
 
-        # --- 融合模块 ---
-        self.fusion_module=PlanarFusionModule(in_channels=128)
 
-        # self.dn2depth = DN_to_depth()
-        self.dn_to_depth_layer = DN_to_depth()
-        self.offset_head = OffsetHead(input_dim=crf_dims[0])
         self.init_weights(pretrained=pretrained)
 
     def init_weights(self, pretrained=None):
@@ -269,105 +322,11 @@ class NewCRFDepth(nn.Module):
     def forward(self, imgs, inv_K, epoch):        
         feats = self.backbone(imgs)
 
-        if self.with_neck:
-            feats = self.neck(feats)
         
-        # depth
-        ppm_out = self.decoder(feats)
-
-        e3 = self.crf3(feats[3], ppm_out)
-        e3 = nn.PixelShuffle(2)(e3)
-        e2 = self.crf2(feats[2], e3)
-        e2 = nn.PixelShuffle(2)(e2)
-        e1 = self.crf1(feats[1], e2)
-        e1 = nn.PixelShuffle(2)(e1)
-        e0 = self.crf0(feats[0], e1)
-
-
-        # normal and distance
-        ppm_out2 = self.decoder2(feats)
-
-        e7 = self.crf7(feats[3], ppm_out2)
-        e7 = nn.PixelShuffle(2)(e7)
-        e6 = self.crf6(feats[2], e7)
-        e6 = nn.PixelShuffle(2)(e6)
-        e5 = self.crf5(feats[1], e6)
-        e5 = nn.PixelShuffle(2)(e5)
-        e4 = self.crf4(feats[0], e5)
-    
         
-        # 3. Head 预测
-        # 预测法线 [B, 3, H, W] (注意：这里假设 head 内部处理了上采样到原图尺寸，或者在这里做)
-        # 通常 head 输出 scale=1 (原图) 或者 scale=4 (特征图)
-        # 这里假设 head 输出与输入同尺寸，后续统一上采样到原图
         
-        # 法线预测 (-1, 1)
-        # pred_normal = self.normal_head1(e4, scale=4) 
-        # pred_normal = F.normalize(pred_normal, dim=1, p=2) # 归一化非常重要
-        
-        # # 距离预测 (0, 1) -> 映射到物理尺度
-        # pred_distance = self.distance_head1(e4, scale=4)
-        # pred_distance = pred_distance * self.max_depth # 映射到最大深度范围
-
-
-        local_normal = self.normal_head1(e4, scale=4) 
-        local_normal = F.normalize(local_normal, dim=1, p=2) # 归一化非常重要
-        
-        # 距离预测 (0, 1) -> 映射到物理尺度
-        local_distance = self.distance_head1(e4, scale=4)
-        local_distance = local_distance * self.max_depth # 映射到最大深度范围
-        
-        # 不确定性预测 (0, 1)
-        pred_uncertainty_nd = self.uncer_head2(e4, scale=4)
-
-        # version 2
-        offset = self.offset_head(e4, scale=4) # [B, 2, H, W]
-
-        # 利用 offset 去采样“更可靠”的平面参数
-        seed_normal = sample_with_offset(local_normal, offset)
-        seed_distance = sample_with_offset(local_distance, offset)
-        seed_normal = F.normalize(seed_normal, dim=1, p=2)
-            # 4. 几何深度合成 (ND -> Depth)
-        # b, c, h, w = pred_normal.shape
-        # device = pred_normal.device
-        
-        # 计算 D_geo = d / (n^T * K^-1 * p)
-        depth_geo = self.dn_to_depth_layer(seed_normal, seed_distance, inv_K)
-        depth_geo = depth_geo.clamp(self.min_depth, self.max_depth)
-
-        # return depth_geo, pred_normal, pred_distance, pred_uncertainty_nd, e4
-        # 非平面----------------------------------------
-
-        # 3. Head 预测
-        # 预测归一化的视差 (0, 1) 或者 深度
-        # 如果是 DispHead，通常预测的是 sigmoid 输出
-        pred_disp_reg = self.disp_head1(e0, scale=4)
-        # 视差转深度: depth = 1 / (disp + epsilon) 或者按照 min/max 映射
-        # 这里使用常见的线性映射反转:
-        # D = min_depth + (max_depth - min_depth) * disp (如果是深度头)
-        # 或者 D = 1 / (min_disp + (max_disp - min_disp) * disp) (如果是视差头)
-        # 假设 DispHead 输出的是 0-1 的相对深度:
-        depth_reg = pred_disp_reg * self.max_depth
-        depth_reg = depth_reg.clamp(self.min_depth, self.max_depth)
-        
-        # 不确定性预测
-        pred_uncertainty_reg = self.uncer_head1(e0, scale=4)
-
-
-        d_final, w_geo = self.fusion_module(depth_geo/self.max_depth, depth_reg/self.max_depth, pred_uncertainty_nd, pred_uncertainty_reg, e4, e0)
-
-        d_final=d_final*self.max_depth
-        
-        return d_final,depth_geo,depth_reg,seed_normal,seed_distance,w_geo,pred_uncertainty_nd,pred_uncertainty_reg
-        # 4. Pack output
-            # outputs = {
-            #     'depth_final': d_final,
-            #     'depth_geo': d_geo,
-            #     'depth_reg': d_reg,
-            #     'pred_normal': n_pred,
-            #     'pred_distance': dist_pred,
-            #     'w_geo': w_geo
-            # }
+      
+       
       
                     
 class DispHead(nn.Module):

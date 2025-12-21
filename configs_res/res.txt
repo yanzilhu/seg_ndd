@@ -6,7 +6,7 @@
 --data_path /home/h/yz/data/nyu_depth_v2/sync/
 --gt_path /home/h/yz/data/nyu_depth_v2/sync/
 --filenames_file data_splits/nyudepthv2_train_files_with_gt_dense.txt
---batch_size 6
+--batch_size 4
 --num_epochs 50
 --learning_rate 2e-5
 --weight_decay 1e-2
@@ -18,11 +18,11 @@
 --degree 2.5
 --log_directory ./result
 --multiprocessing_distributed
---dist_url tcp://127.0.0.1:2358
+--dist_url tcp://127.0.0.1:2351
 
 --log_freq 100
 --do_online_eval
---eval_freq 1000
+--eval_freq 2000
 --data_path_eval /home/h/yz/data/nyu_depth_v2/official_splits/test/
 --gt_path_eval /home/h/yz/data/nyu_depth_v2//official_splits/test/
 --filenames_file_eval data_splits/nyudepthv2_test_files_with_gt.txt

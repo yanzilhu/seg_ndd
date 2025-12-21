@@ -121,7 +121,7 @@ def compute_smooth_loss(tgt_map):
         
         # 为了保证维度对齐，我们在最后一行/列补零，或者切片时对齐
         # 这里采用切片对齐方式：
-        # grad_x: [:, :, :, :-1]
+        # grad_x: [:, :, :, :-1]_
         grad_x = torch.abs(x[:, :, :, :-1] - x[:, :, :, 1:])
         grad_y = torch.abs(x[:, :, :-1, :] - x[:, :, 1:, :])
         
