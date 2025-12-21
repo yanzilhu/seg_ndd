@@ -21,3 +21,6 @@ debug_models/
 *.log
 # TensorBoard日志文件（事件日志，不上传）
 events.out.tfevents.*
+mytest/
+img/
+result/

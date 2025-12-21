@@ -6,179 +6,53 @@ from .swin_transformer import SwinTransformer
 from .newcrf_layers import NewCRF
 from .uper_crf_head import PSP
 from utils import DN_to_depth
+########################################################################################################################
+# from .semantic_head import SemanticHead, PlaneGuidanceModule # [引用新增模块]
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-# 曼哈顿
-class ManhattanBasisHead(nn.Module):
+
+from transformers import SegformerForSemanticSegmentation
+class PlaneGuidanceModule(nn.Module):
     """
-    输入：e0（B, C, H, W）等高层特征
-    输出：R（B, 3, 3），表示每张图的Manhattan基（正交化，det>0）
+    语义条件化平面查询模块 PGM
+    输入:
+        feat: CRF 最后一层特征 e0 (B×C×H×W) 
+        sem_emb: 语义 embedding (B×C×H×W)
+    输出:
+        enhanced_feat  (融合语义+几何)
+        plane_att      (K×H×W) 平面注意图
     """
-    def __init__(self, in_channels, hidden_dim=128):
+    def __init__(self, feat_dim=256, K=8):
         super().__init__()
-        self.conv = nn.Conv2d(in_channels, hidden_dim, kernel_size=3, padding=1)
-        self.act = nn.ReLU(inplace=True)
-        self.proj = nn.Conv2d(hidden_dim, 9, kernel_size=1, padding=0)  # 直接预测9个数
+        self.K = K
 
-    @staticmethod
-    def _gram_schmidt_orthonormalize(B):  # B: (B, 3, 3)
-        # 列向量正交化
-        u1 = B[:, :, 0]
-        e1 = F.normalize(u1, dim=1)
+        self.sem_fuse = nn.Conv2d(feat_dim, feat_dim, 1)
 
-        u2 = B[:, :, 1] - (torch.sum(B[:, :, 1] * e1, dim=1, keepdim=True) * e1)
-        e2 = F.normalize(u2 + 1e-8, dim=1)
-
-        u3 = B[:, :, 2] \
-             - (torch.sum(B[:, :, 2] * e1, dim=1, keepdim=True) * e1) \
-             - (torch.sum(B[:, :, 2] * e2, dim=1, keepdim=True) * e2)
-        e3 = F.normalize(u3 + 1e-8, dim=1)
-
-        R = torch.stack([e1, e2, e3], dim=2)  # (B,3,3)
-        # 保证det>0：若det<0则翻转第三列
-        det = torch.det(R)
-        flip = (det < 0).float().view(-1, 1)   # (B, 1)
-        e3_flipped = e3 * (1.0 - 2.0 * flip)
-        R = torch.stack([e1, e2, e3_flipped], dim=2)
-        return R
-
-    def forward(self, x):
-        # x: (B,C,H,W)
-        h = self.act(self.conv(x))
-        b, c, hH, hW = h.shape
-        # GAP到 (B, hidden, 1, 1) -> (B, 9)
-        g = F.adaptive_avg_pool2d(h, 1)
-        nine = self.proj(g).view(b, 9)
-        Bmat = nine.view(b, 3, 3)
-        R = self._gram_schmidt_orthonormalize(Bmat)
-        return R  # (B,3,3)
-# 平面门控
-class PlaneGateHead(nn.Module):
-    """
-    输入：e0（B, C, H, W）
-    输出：P（B, K, H, W），例如K=3分别表示{墙, 地, 顶}的软门控概率（softmax）
-    """
-    def __init__(self, in_channels, num_planes=3):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, in_channels, 3, padding=1)
-        self.act = nn.ReLU(inplace=True)
-        self.proj = nn.Conv2d(in_channels, num_planes, 1)
-
-    def forward(self, x):
-        h = self.act(self.conv1(x))
-        logits = self.proj(h)             # (B,K,H,W)
-        P = torch.softmax(logits, dim=1)  # 通道维softmax
-        return P
-
-# DPF可微笑（可微局部平面拟合 + 平面深度重建）
-# 给定深度图 z、相机内参逆 inv_K 与K个区域权重 W（软掩码），先把 z 回投为点云，
-# 再对每个区域做加权SVD/特征分解拟合平面 (n_k, d_k)，最后把各平面拼回像素层的平面深度 z_plane（用区域权重做软选择，保持可微）。
-class DPFLayer(nn.Module):
-    def __init__(self, tau=20.0, eps=1e-6, min_region_area=20):
-        super().__init__()
-        self.tau = tau
-        self.eps = eps
-        self.min_region_area = min_region_area
-
-    @staticmethod
-    def _make_rays(inv_K, H, W, device, dtype=torch.float32):
-        # pixel homogeneous coords (3,H,W)
-        ys, xs = torch.meshgrid(
-            torch.arange(0, H, device=device),
-            torch.arange(0, W, device=device),
-            indexing='ij'
+        self.query_mlp = nn.Sequential(
+            nn.Linear(feat_dim, feat_dim),
+            nn.ReLU(),
+            nn.Linear(feat_dim, K * feat_dim)
         )
-        ones = torch.ones_like(xs, dtype=dtype, device=device)
-        pix = torch.stack([xs.to(dtype=dtype), ys.to(dtype=dtype), ones], dim=0)  # (3,H,W)
-        pix = pix.unsqueeze(0).expand(inv_K.shape[0], -1, -1, -1)  # (B,3,H,W)
 
-        # inv_K: (B,3,3) ; rays = inv_K @ pix
-        # use einsum with correct subscripts
-        rays = torch.einsum('bij,bjhw->bihw', inv_K.to(dtype=dtype), pix)  # (B,3,H,W)
-        rays = F.normalize(rays, dim=1)
-        return rays
+        self.fuse = nn.Conv2d(feat_dim * 2, feat_dim, 1)
 
-    def forward(self, depth_map, inv_K, region_w):
-        """
-        depth_map: (B,1,H,W) - may be float16 from autocast; we'll compute in float32
-        inv_K:     (B,3,3)
-        region_w:  (B,K,H,W) soft-weights
-        """
-       
-        B, _, H, W = depth_map.shape
-        K = region_w.shape[1]
-        device = depth_map.device
+    def forward(self, feat, sem_emb):
+        B, C, H, W = feat.shape
 
-        # compute rays and X in float32 for numerical stability
-        inv_K = inv_K[:, :3, :3]
-        invK_f32 = inv_K.to(device=device).to(torch.float32)
-        depth_f32 = depth_map.to(torch.float32)
-        # 清理非有限深度（来自上游可能的除零/溢出），防止协方差 nan
-        depth_f32  = torch.where(torch.isfinite(depth_f32), depth_f32, torch.zeros_like(depth_f32))
-        rays = self._make_rays(invK_f32, H, W, device, dtype=torch.float32)  # (B,3,H,W)
-        X = rays * depth_f32  # (B,3,H,W)
+        sem_emb = self.sem_fuse(sem_emb)
 
-        # normalize region weights per region
-        w = region_w.clamp(min=0.0).to(torch.float32) + self.eps  # (B,K,H,W)
-        w_sum = torch.sum(w, dim=(2, 3), keepdim=True) + self.eps     # (B,K,1,1)
-        w_norm = w / w_sum
+        g = F.adaptive_avg_pool2d(sem_emb, 1).view(B, C)
+        Q = self.query_mlp(g).view(B, self.K, C)
 
-        # optionally zero-out regions that are too small (avoid degenerate cov)
-        area = torch.sum((region_w > 0.01).to(torch.float32), dim=(2,3))  # (B,K)
-        small_region_mask = (area < float(self.min_region_area)).unsqueeze(-1).unsqueeze(-1)  # (B,K,1,1)
-        w_norm = torch.where(small_region_mask, torch.zeros_like(w_norm), w_norm)
+        feat_flat = feat.view(B, C, -1)
+        att = torch.einsum("bkd,bdv->bkv", Q, feat_flat)
+        att = F.softmax(att, dim=1).view(B, self.K, H, W)
 
-        # weighted centroid mu_k
-        X_flat = X.view(B, 3, -1)                         # (B,3,N)
-        w_flat = w_norm.view(B, K, -1)                    # (B,K,N)
-        mu = torch.einsum('bkn,bcn->bkc', w_flat, X_flat)  # (B,K,3)
+        Q_exp = Q[:, :, :, None, None]
+        G = (att[:, :, None] * Q_exp).sum(1)
 
-            # weighted covariance
-        X_exp = X_flat.unsqueeze(1).expand(B, K, 3, H*W)   # (B,K,3,N)
-        mu_exp = mu.unsqueeze(-1)                         # (B,K,3,1)
-        Xm = X_exp - mu_exp                               # (B,K,3,N)
-        wN = w_flat.unsqueeze(2)                          # (B,K,1,N)
-        Xm_w = Xm * wN                                    # (B,K,3,N)
-        cov = torch.einsum('bkcn,bkdn->bkcd', Xm_w, Xm)   # (B,K,3,3)
-        cov = 0.5 * (cov + cov.transpose(-1, -2)) + torch.eye(3, device=device) * 1e-6
-        # eigen-decomp (float32). torch.linalg.eigh is differentiable.
-        eigvals, eigvecs = torch.linalg.eigh(cov)         # eigvals:(B,K,3), eigvecs:(B,K,3,3)
-        n = eigvecs[..., 0]                               # smallest-eigvec => normal (B,K,3)
-        n = F.normalize(n, dim=-1)
-
-        # canonicalize direction so that n_z >= 0 (camera forward z)
-        sign = torch.where(n[..., 2:3] < 0, -1.0, 1.0)
-        n = n * sign
-
-        # d = - n^T mu
-        d = -torch.sum(n * mu, dim=-1, keepdim=True)     # (B,K,1)
-
-        # denom = n · rays  -> (B,K,H,W)
-        denom = torch.einsum('bkc,bchw->bkhw', n, rays)  # (B,K,H,W)
-        denom = denom.clamp(min=1e-3)  # avoid division-by-zero / huge values
-
-        z_k_map = -d.unsqueeze(-1) / denom  # (B,K,H,W) broadcast -> ensure shapes OK
-        # numerical guard: remove non-finite
-        z_k_map = torch.where(torch.isfinite(z_k_map), z_k_map, torch.zeros_like(z_k_map))
-
-        # soft selection via region_w with temperature
-        # gate = torch.softmax(self.tau * w, dim=1)        # (B,K,H,W)
-        # z_plane = torch.sum(gate * z_k_map, dim=1, keepdim=True)  # (B,1,H,W)
-
-        gate = torch.softmax(self.tau * w, dim=1)
-        # 只有当某个像素属于某个平面的概率极高时（比如 > 0.8），才应用 z_plane
-        # 否则保持原始深度。这样可以保护桌子椅子不被拍平。
-        max_prob, _ = torch.max(gate, dim=1, keepdim=True)
-        is_plane_mask = (max_prob > 0.8).float()
-
-        # 3. 计算修正后的平面深度，非平面区域保留原深度（detach 防止干扰拟合梯度）
-        z_plane_sum = torch.sum(gate * z_k_map, dim=1, keepdim=True)
-        z_plane_final = is_plane_mask * z_plane_sum + (1 - is_plane_mask) * depth_map.detach() 
-
-        # 返回修改后的 z_plane_final
-        return n, d, z_plane_final, z_k_map
+        out = torch.cat([feat, G], dim=1)
+        out = self.fuse(out)
+        return out, att
 
 class NewCRFDepth(nn.Module):
     """
@@ -280,22 +154,41 @@ class NewCRFDepth(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Conv2d(64, 16*9, 1, padding=0))
             
+        self.update = BasicUpdateBlockDepth()
+
         self.min_depth = min_depth
         self.max_depth = max_depth
 
-        self.up_mode = 'bilinear'
-        if self.up_mode == 'mask':
-            self.mask_head2 = nn.Sequential(
-                nn.Conv2d(crf_dims[0], 64, 3, padding=1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(64, 16*9, 1, padding=0))
-            
-        self.update = BasicUpdateBlockDepth()
-        
-        self.manhattan_head = ManhattanBasisHead(in_channels=5)
-        self.plane_gate     = PlaneGateHead(in_channels=5, num_planes=3)  # [墙, 地, 顶]
-        self.dpf_layer      = DPFLayer(tau=20.0)
+        # -----------------------------
+        # SegFormer 语义分割模型
+        # -----------------------------
 
+        self.segformer = SegformerForSemanticSegmentation.from_pretrained(
+            "nvidia/segformer-b5-finetuned-ade-640-640"
+        )
+        # NYU 只有 40 类，但 SegFormer-B5 是 150 类 ADE20K → 直接用 embedding，就不 fine-tune。
+        for p in self.segformer.parameters():
+            p.requires_grad = False
+
+        # NYU→你不需要 150 类语义标签，仅使用 embedding
+        # 将 150 通道语义 logits 映射到与 e0 相同维度
+        self.semantic_proj = nn.Conv2d(150, crf_dims[0], kernel_size=1)
+
+        # ------------------------------------------------------------
+        # 语义平面概率预测 Head（plane segmentation）
+        # ------------------------------------------------------------
+        self.sem_head = nn.Sequential(
+            nn.Conv2d(crf_dims[0], crf_dims[0], 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(crf_dims[0], 2, 1)   # 输出：平面/非平面 logits
+        )
+        # ------------------------------------------------------------
+        # PGM：平面语义引导模块
+        # ------------------------------------------------------------
+        self.pgm = PlaneGuidanceModule(
+            feat_dim=crf_dims[0],   # e0 的通道数
+            K=8                     # 平面查询个数，可调
+        )
                 
         self.init_weights(pretrained=pretrained)
 
@@ -337,8 +230,10 @@ class NewCRFDepth(nn.Module):
         up_disp = up_disp.permute(0, 1, 4, 2, 5, 3)
         return up_disp.reshape(N, 1, 4*H, 4*W)
 
-    def forward(self, imgs, inv_K, epoch):        
+    def forward(self, imgs, inv_K, epoch):
+        
         feats = self.backbone(imgs)
+
         if self.with_neck:
             feats = self.neck(feats)
         
@@ -352,7 +247,33 @@ class NewCRFDepth(nn.Module):
         e1 = self.crf1(feats[1], e2)
         e1 = nn.PixelShuffle(2)(e1)
         e0 = self.crf0(feats[0], e1)
-       
+# PGM
+        #  ------------------------------------------------------------
+        # Step A：提取语义 logits（不训练）
+        # SegFormer 输出为 B×150×H/4×W/4 → resize 到 e0 大小
+        sem_out = self.segformer(pixel_values=imgs)
+        sem_logits = sem_out.logits
+        sem_logits = F.interpolate(
+            sem_logits,
+            size=e0.shape[-2:],
+            mode="bilinear",
+            align_corners=False
+        )
+
+        # 映射到 e0 通道数
+        sem_emb = self.semantic_proj(sem_logits)    
+        # ------------------------------------------------------------
+        # Step B：语义平面概率图（用于监督/可视化）
+        # ------------------------------------------------------------
+        prob_planar = self.sem_head(sem_emb)  # B×2×H×W
+
+        # ------------------------------------------------------------
+        # Step C：PGM 融合 e0 和语义
+        # ------------------------------------------------------------
+        e0, plane_att = self.pgm(e0, sem_emb)
+    
+        # =======================================================================
+
         if self.up_mode == 'mask':
             mask = self.mask_head(e0)
             d1 = self.disp_head1(e0, 1)
@@ -394,7 +315,7 @@ class NewCRFDepth(nn.Module):
         distance = dist1 * self.max_depth 
         n1_norm = F.normalize(n1, dim=1, p=2)
         depth2 = dn_to_depth(n1_norm, distance, inv_K).clamp(0, self.max_depth)
-
+        
         if epoch < 5:
             depth1 = upsample(d1, scale_factor=4) * self.max_depth
             u1 = upsample(u1, scale_factor=4)
@@ -403,23 +324,8 @@ class NewCRFDepth(nn.Module):
             n1_norm = upsample(n1_norm, scale_factor=4)
             distance = upsample(distance, scale_factor=4)
 
-            eps = 1e-6
-            # u1/u2 期望和 uncer_gt 同分布 (较大 -> 更可信)
-            w1 = u1.clamp(min=eps)
-            w2 = u2.clamp(min=eps)
-            final_depth = (w1 * depth1 + w2 * depth2) / (w1 + w2 + eps)
-
-            geo_in = torch.cat([n1_norm, distance, final_depth], dim=1)
-            # ---- 计算 R / P / DPF 拼回平面深度 ----
-            R = self.manhattan_head(geo_in)                       # (B,3,3)
-            P = self.plane_gate(geo_in)                           # (B,3,h,w) (与 geo_in 同分辨率)
-            # 若 geo_in 分辨率 < depth 分辨率，可在此上采样，这里二者一致无需上采样
-            P_full = P
-
-            # n_k, d_k, z_plane, z_k_map = self.dpf_layer(final_depth, inv_K, P_full)
-            _, _, z_plane, z_k_map = self.dpf_layer(final_depth, inv_K, P_full) 
-
-            return depth1, u1, depth2, u2, n1_norm, distance,final_depth,R,P_full,z_plane,z_k_map
+            return depth1, u1, depth2, u2, n1_norm, distance,prob_planar,sem_logits
+            # return depth1, u1, depth2, u2, n1_norm, distance
         
         else:
             depth1 = d1
@@ -437,28 +343,8 @@ class NewCRFDepth(nn.Module):
             n1_norm = upsample(n1_norm, scale_factor=4)
             distance = upsample(distance, scale_factor=4)
 
-            eps = 1e-6
-            # u1/u2 期望和 uncer_gt 同分布 (较大 -> 更可信)
-            w1 = u1.clamp(min=eps)
-            w2 = u2.clamp(min=eps)
-            final_depth = (w1 * depth1_list[-1] + w2 * depth2_list[-1]) / (w1 + w2 + eps)
-
-            geo_in = torch.cat([n1_norm, distance, final_depth], dim=1)
-            # ---- 计算 R / P / DPF 拼回平面深度 ----
-            R = self.manhattan_head(geo_in)                       # (B,3,3)
-            P = self.plane_gate(geo_in)                           # (B,3,h,w) (与 geo_in 同分辨率)
-            # 若 geo_in 分辨率 < depth 分辨率，可在此上采样，这里二者一致无需上采样
-            P_full = P
-
-            # n_k, d_k, z_plane, z_k_map = self.dpf_layer(final_depth, inv_K, P_full) 
-            _, _, z_plane, z_k_map = self.dpf_layer(final_depth, inv_K, P_full) 
-
-
-            return depth1_list, u1, depth2_list, u2, n1_norm, distance, final_depth,R,P_full,z_plane,z_k_map                    
-        
-    
-
-      
+            return depth1_list, u1, depth2_list, u2, n1_norm, distance,prob_planar ,sem_logits
+            # return depth1_list, u1, depth2_list, u2, n1_norm, distance                                                         
                     
 class DispHead(nn.Module):
     def __init__(self, input_dim=100):

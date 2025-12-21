@@ -16,7 +16,7 @@
 --input_width 640
 --max_depth 10
 --degree 2.5
---log_directory ./debug_models/
+--log_directory ./result
 --multiprocessing_distributed
 --dist_url tcp://127.0.0.1:2358
 

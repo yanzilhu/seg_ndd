@@ -1,0 +1,16 @@
+python nddepth/train.py configs/nyu_debug.txt
+
+python nddepth/train.py configs/nyu_train.txt
+tensorboard --logdir=debug_models/1113/nddepth_nyu_debug/summaries
+
+
+eval
+
+python nddepth/eval.py configs/eval_nyu.txt
+5090
+python nddepth/train_50.py configs/nyu_train_r0.txt
+nohup python nddepth/train_50.py configs/nyu_train_r0.txt > train.log 2>&1 &
+
+python nddepth/eval_r50.py configs/eval_nyu_r50.txt
+
+python nddepth/train_50_dpf.py configs/nyu_train_r0.txt

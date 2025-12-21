@@ -10,175 +10,36 @@ from utils import DN_to_depth
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-# 曼哈顿
-class ManhattanBasisHead(nn.Module):
+# -------------------------------------------------------------------------
+# 0. 辅助模块
+# -------------------------------------------------------------------------
+
+class GatedFusion(nn.Module):
+    """ 
+    门控融合模块：根据特征图决定在某个像素是信任几何深度还是残差深度
     """
-    输入：e0（B, C, H, W）等高层特征
-    输出：R（B, 3, 3），表示每张图的Manhattan基（正交化，det>0）
-    """
-    def __init__(self, in_channels, hidden_dim=128):
+    def __init__(self, in_channels):
         super().__init__()
-        self.conv = nn.Conv2d(in_channels, hidden_dim, kernel_size=3, padding=1)
-        self.act = nn.ReLU(inplace=True)
-        self.proj = nn.Conv2d(hidden_dim, 9, kernel_size=1, padding=0)  # 直接预测9个数
-
-    @staticmethod
-    def _gram_schmidt_orthonormalize(B):  # B: (B, 3, 3)
-        # 列向量正交化
-        u1 = B[:, :, 0]
-        e1 = F.normalize(u1, dim=1)
-
-        u2 = B[:, :, 1] - (torch.sum(B[:, :, 1] * e1, dim=1, keepdim=True) * e1)
-        e2 = F.normalize(u2 + 1e-8, dim=1)
-
-        u3 = B[:, :, 2] \
-             - (torch.sum(B[:, :, 2] * e1, dim=1, keepdim=True) * e1) \
-             - (torch.sum(B[:, :, 2] * e2, dim=1, keepdim=True) * e2)
-        e3 = F.normalize(u3 + 1e-8, dim=1)
-
-        R = torch.stack([e1, e2, e3], dim=2)  # (B,3,3)
-        # 保证det>0：若det<0则翻转第三列
-        det = torch.det(R)
-        flip = (det < 0).float().view(-1, 1)   # (B, 1)
-        e3_flipped = e3 * (1.0 - 2.0 * flip)
-        R = torch.stack([e1, e2, e3_flipped], dim=2)
-        return R
-
-    def forward(self, x):
-        # x: (B,C,H,W)
-        h = self.act(self.conv(x))
-        b, c, hH, hW = h.shape
-        # GAP到 (B, hidden, 1, 1) -> (B, 9)
-        g = F.adaptive_avg_pool2d(h, 1)
-        nine = self.proj(g).view(b, 9)
-        Bmat = nine.view(b, 3, 3)
-        R = self._gram_schmidt_orthonormalize(Bmat)
-        return R  # (B,3,3)
-# 平面门控
-class PlaneGateHead(nn.Module):
-    """
-    输入：e0（B, C, H, W）
-    输出：P（B, K, H, W），例如K=3分别表示{墙, 地, 顶}的软门控概率（softmax）
-    """
-    def __init__(self, in_channels, num_planes=3):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, in_channels, 3, padding=1)
-        self.act = nn.ReLU(inplace=True)
-        self.proj = nn.Conv2d(in_channels, num_planes, 1)
-
-    def forward(self, x):
-        h = self.act(self.conv1(x))
-        logits = self.proj(h)             # (B,K,H,W)
-        P = torch.softmax(logits, dim=1)  # 通道维softmax
-        return P
-
-# DPF可微笑（可微局部平面拟合 + 平面深度重建）
-# 给定深度图 z、相机内参逆 inv_K 与K个区域权重 W（软掩码），先把 z 回投为点云，
-# 再对每个区域做加权SVD/特征分解拟合平面 (n_k, d_k)，最后把各平面拼回像素层的平面深度 z_plane（用区域权重做软选择，保持可微）。
-class DPFLayer(nn.Module):
-    def __init__(self, tau=20.0, eps=1e-6, min_region_area=20):
-        super().__init__()
-        self.tau = tau
-        self.eps = eps
-        self.min_region_area = min_region_area
-
-    @staticmethod
-    def _make_rays(inv_K, H, W, device, dtype=torch.float32):
-        # pixel homogeneous coords (3,H,W)
-        ys, xs = torch.meshgrid(
-            torch.arange(0, H, device=device),
-            torch.arange(0, W, device=device),
-            indexing='ij'
+        self.conv_gate = nn.Sequential(
+            nn.Conv2d(in_channels * 2, in_channels, 3, padding=1),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, 1, 1),
+            nn.Sigmoid()
         )
-        ones = torch.ones_like(xs, dtype=dtype, device=device)
-        pix = torch.stack([xs.to(dtype=dtype), ys.to(dtype=dtype), ones], dim=0)  # (3,H,W)
-        pix = pix.unsqueeze(0).expand(inv_K.shape[0], -1, -1, -1)  # (B,3,H,W)
 
-        # inv_K: (B,3,3) ; rays = inv_K @ pix
-        # use einsum with correct subscripts
-        rays = torch.einsum('bij,bjhw->bihw', inv_K.to(dtype=dtype), pix)  # (B,3,H,W)
-        rays = F.normalize(rays, dim=1)
-        return rays
+    def forward(self, feat_geo, feat_res, d_geo, d_res):
+        # 拼接几何分支和残差分支的特征
+        cat_feat = torch.cat([feat_geo, feat_res], dim=1)
+        # 生成门控权重 (0~1): 1表示倾向于 d_geo (平面), 0表示倾向于 d_res (细节)
+        gate = self.conv_gate(cat_feat)
+        
+        # 融合深度
+        d_final = gate * d_geo + (1 - gate) * d_res
+        return d_final, gate
+    
 
-    def forward(self, depth_map, inv_K, region_w):
-        """
-        depth_map: (B,1,H,W) - may be float16 from autocast; we'll compute in float32
-        inv_K:     (B,3,3)
-        region_w:  (B,K,H,W) soft-weights
-        """
-       
-        B, _, H, W = depth_map.shape
-        K = region_w.shape[1]
-        device = depth_map.device
 
-        # compute rays and X in float32 for numerical stability
-        inv_K = inv_K[:, :3, :3]
-        invK_f32 = inv_K.to(device=device).to(torch.float32)
-        depth_f32 = depth_map.to(torch.float32)
-        # 清理非有限深度（来自上游可能的除零/溢出），防止协方差 nan
-        depth_f32  = torch.where(torch.isfinite(depth_f32), depth_f32, torch.zeros_like(depth_f32))
-        rays = self._make_rays(invK_f32, H, W, device, dtype=torch.float32)  # (B,3,H,W)
-        X = rays * depth_f32  # (B,3,H,W)
-
-        # normalize region weights per region
-        w = region_w.clamp(min=0.0).to(torch.float32) + self.eps  # (B,K,H,W)
-        w_sum = torch.sum(w, dim=(2, 3), keepdim=True) + self.eps     # (B,K,1,1)
-        w_norm = w / w_sum
-
-        # optionally zero-out regions that are too small (avoid degenerate cov)
-        area = torch.sum((region_w > 0.01).to(torch.float32), dim=(2,3))  # (B,K)
-        small_region_mask = (area < float(self.min_region_area)).unsqueeze(-1).unsqueeze(-1)  # (B,K,1,1)
-        w_norm = torch.where(small_region_mask, torch.zeros_like(w_norm), w_norm)
-
-        # weighted centroid mu_k
-        X_flat = X.view(B, 3, -1)                         # (B,3,N)
-        w_flat = w_norm.view(B, K, -1)                    # (B,K,N)
-        mu = torch.einsum('bkn,bcn->bkc', w_flat, X_flat)  # (B,K,3)
-
-            # weighted covariance
-        X_exp = X_flat.unsqueeze(1).expand(B, K, 3, H*W)   # (B,K,3,N)
-        mu_exp = mu.unsqueeze(-1)                         # (B,K,3,1)
-        Xm = X_exp - mu_exp                               # (B,K,3,N)
-        wN = w_flat.unsqueeze(2)                          # (B,K,1,N)
-        Xm_w = Xm * wN                                    # (B,K,3,N)
-        cov = torch.einsum('bkcn,bkdn->bkcd', Xm_w, Xm)   # (B,K,3,3)
-        cov = 0.5 * (cov + cov.transpose(-1, -2)) + torch.eye(3, device=device) * 1e-6
-        # eigen-decomp (float32). torch.linalg.eigh is differentiable.
-        eigvals, eigvecs = torch.linalg.eigh(cov)         # eigvals:(B,K,3), eigvecs:(B,K,3,3)
-        n = eigvecs[..., 0]                               # smallest-eigvec => normal (B,K,3)
-        n = F.normalize(n, dim=-1)
-
-        # canonicalize direction so that n_z >= 0 (camera forward z)
-        sign = torch.where(n[..., 2:3] < 0, -1.0, 1.0)
-        n = n * sign
-
-        # d = - n^T mu
-        d = -torch.sum(n * mu, dim=-1, keepdim=True)     # (B,K,1)
-
-        # denom = n · rays  -> (B,K,H,W)
-        denom = torch.einsum('bkc,bchw->bkhw', n, rays)  # (B,K,H,W)
-        denom = denom.clamp(min=1e-3)  # avoid division-by-zero / huge values
-
-        z_k_map = -d.unsqueeze(-1) / denom  # (B,K,H,W) broadcast -> ensure shapes OK
-        # numerical guard: remove non-finite
-        z_k_map = torch.where(torch.isfinite(z_k_map), z_k_map, torch.zeros_like(z_k_map))
-
-        # soft selection via region_w with temperature
-        # gate = torch.softmax(self.tau * w, dim=1)        # (B,K,H,W)
-        # z_plane = torch.sum(gate * z_k_map, dim=1, keepdim=True)  # (B,1,H,W)
-
-        gate = torch.softmax(self.tau * w, dim=1)
-        # 只有当某个像素属于某个平面的概率极高时（比如 > 0.8），才应用 z_plane
-        # 否则保持原始深度。这样可以保护桌子椅子不被拍平。
-        max_prob, _ = torch.max(gate, dim=1, keepdim=True)
-        is_plane_mask = (max_prob > 0.8).float()
-
-        # 3. 计算修正后的平面深度，非平面区域保留原深度（detach 防止干扰拟合梯度）
-        z_plane_sum = torch.sum(gate * z_k_map, dim=1, keepdim=True)
-        z_plane_final = is_plane_mask * z_plane_sum + (1 - is_plane_mask) * depth_map.detach() 
-
-        # 返回修改后的 z_plane_final
-        return n, d, z_plane_final, z_k_map
 
 class NewCRFDepth(nn.Module):
     """
@@ -251,7 +112,8 @@ class NewCRFDepth(nn.Module):
         self.crf0 = NewCRF(input_dim=in_channels[0], embed_dim=crf_dims[0], window_size=win, v_dim=v_dims[0], num_heads=4)
 
         self.decoder = PSP(**decoder_cfg)
-        self.disp_head1 = DispHead(input_dim=crf_dims[0])
+        self.depth_head_res  = DispHead(input_dim=crf_dims[0])  # 输出 D_res
+
         self.uncer_head1 = UncerHead1(input_dim=crf_dims[0])
 
         self.up_mode = 'bilinear'
@@ -266,12 +128,12 @@ class NewCRFDepth(nn.Module):
         self.crf6 = NewCRF(input_dim=in_channels[2], embed_dim=crf_dims[2], window_size=win, v_dim=v_dims[2], num_heads=16)
         self.crf5 = NewCRF(input_dim=in_channels[1], embed_dim=crf_dims[1], window_size=win, v_dim=v_dims[1], num_heads=8)
         self.crf4 = NewCRF(input_dim=in_channels[0], embed_dim=crf_dims[0], window_size=win, v_dim=v_dims[0], num_heads=4)
+        self.decoder_geo = PSP(**decoder_cfg)
+        # self.decoder2 = PSP(**decoder_cfg)
 
-        self.decoder2 = PSP(**decoder_cfg)
-
-        self.normal_head1 = NormalHead(input_dim=crf_dims[0])
-        self.distance_head1 = DistanceHead(input_dim=crf_dims[0])
-        self.uncer_head2 = UncerHead2(input_dim=crf_dims[0])
+        self.normal_head = NormalHead(input_dim=crf_dims[0])
+        self.dist_head  = DistanceHead(input_dim=crf_dims[0])
+        # self.uncer_head2 = UncerHead2(input_dim=crf_dims[0])
 
         self.up_mode = 'bilinear'
         if self.up_mode == 'mask':
@@ -283,20 +145,11 @@ class NewCRFDepth(nn.Module):
         self.min_depth = min_depth
         self.max_depth = max_depth
 
-        self.up_mode = 'bilinear'
-        if self.up_mode == 'mask':
-            self.mask_head2 = nn.Sequential(
-                nn.Conv2d(crf_dims[0], 64, 3, padding=1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(64, 16*9, 1, padding=0))
-            
-        self.update = BasicUpdateBlockDepth()
-        
-        self.manhattan_head = ManhattanBasisHead(in_channels=5)
-        self.plane_gate     = PlaneGateHead(in_channels=5, num_planes=3)  # [墙, 地, 顶]
-        self.dpf_layer      = DPFLayer(tau=20.0)
+        # self.update = BasicUpdateBlockDepth()
+        # --- 融合模块 ---
+        self.fusion_gate = GatedFusion(in_channels=crf_dims[0])
+        self.dn2depth = DN_to_depth()
 
-                
         self.init_weights(pretrained=pretrained)
 
     def init_weights(self, pretrained=None):
@@ -343,9 +196,12 @@ class NewCRFDepth(nn.Module):
             feats = self.neck(feats)
         
         # depth
-        ppm_out = self.decoder(feats)  #B,512,15,20
+        # ==========================================================
+        # 3. 分支二：残差/细节深度分支 (Residual Depth Branch)
+        # ==========================================================
+        ppm_out_res = self.decoder(feats)  #B,512,15,20
 
-        e3 = self.crf3(feats[3], ppm_out)
+        e3 = self.crf3(feats[3], ppm_out_res)
         e3 = nn.PixelShuffle(2)(e3)
         e2 = self.crf2(feats[2], e3)
         e2 = nn.PixelShuffle(2)(e2)
@@ -353,20 +209,18 @@ class NewCRFDepth(nn.Module):
         e1 = nn.PixelShuffle(2)(e1)
         e0 = self.crf0(feats[0], e1)
        
-        if self.up_mode == 'mask':
-            mask = self.mask_head(e0)
-            d1 = self.disp_head1(e0, 1)
-            u1 = self.uncer_head1(e0, 1)
-            d1 = self.upsample_mask(d1, mask)
-            u1 = self.upsample_mask(u1, mask)
-        else:
-            d1 = self.disp_head1(e0, 1)
-            u1 = self.uncer_head1(e0, 1)
+
+        # 预测细节深度 D_res (作为基准深度)
+        d_res = self.depth_head_res(e0, scale=4) * self.max_depth
 
         # normal and distance
-        ppm_out2 = self.decoder2(feats)
+           # ==========================================================
+        # 2. 分支一：表面法线与平面距离分支 (N-D Branch)
+        # ==========================================================
+        ppm_out_geo = self.decoder_geo(feats)
+        # ppm_out2 = self.decoder2(feats)
 
-        e7 = self.crf7(feats[3], ppm_out2)
+        e7 = self.crf7(feats[3], ppm_out_geo)
         e7 = nn.PixelShuffle(2)(e7)
         e6 = self.crf6(feats[2], e7)
         e6 = nn.PixelShuffle(2)(e6)
@@ -374,84 +228,83 @@ class NewCRFDepth(nn.Module):
         e5 = nn.PixelShuffle(2)(e5)
         e4 = self.crf4(feats[0], e5)
 
-        if self.up_mode == 'mask':
-            mask2 = self.mask_head2(e4)
-            n1 = self.normal_head1(e4, 1)
-            dist1 = self.distance_head1(e4, 1)
-            u2 = self.uncer_head2(e4, 1)
-            n1 = self.upsample_mask(n1, mask2)
-            dist1 = self.upsample_mask(dist1, mask2)
-            u2 = self.upsample_mask(u2, mask2)
-        else:
-            n1 = self.normal_head1(e4, 1)
-            dist1 = self.distance_head1(e4, 1)
-            u2 = self.uncer_head2(e4, 1)
+        # if self.up_mode == 'mask':
+        #     mask2 = self.mask_head2(e4)
+        #     n1 = self.normal_head1(e4, 1)
+        #     dist1 = self.distance_head1(e4, 1)
+        #     u2 = self.uncer_head2(e4, 1)
+        #     n1 = self.upsample_mask(n1, mask2)
+        #     dist1 = self.upsample_mask(dist1, mask2)
+        #     u2 = self.upsample_mask(u2, mask2)
+        # else:
+        #     n1 = self.normal_head1(e4, 1)
+        #     dist1 = self.distance_head1(e4, 1)
+        #     u2 = self.uncer_head2(e4, 1)
 
-        b, c, h, w =  n1.shape 
-        device = n1.device  
-        dn_to_depth = DN_to_depth(b, h, w).to(device)
+        # 预测几何参数
+        n_pred = self.normal_head(e4, scale=4)        # 上采样到全分辨率 [B, 3, H, W]
+        d_pred_raw = self.dist_head(e4, scale=4)      # 上采样到全分辨率 [B, 1, H, W] (0~1)
+        # 归一化与尺度映射
+        n_norm = F.normalize(n_pred, dim=1, p=2)
+        d_real = d_pred_raw * self.max_depth
+        # 几何求解深度 D_geo
+        # 注意：这里需要传入 3x3 的内参
+        d_geo = self.dn2depth(n_norm, d_real, inv_K[:, :3, :3])
+        d_geo = torch.clamp(d_geo, self.min_depth, self.max_depth)
 
-        distance = dist1 * self.max_depth 
-        n1_norm = F.normalize(n1, dim=1, p=2)
-        depth2 = dn_to_depth(n1_norm, distance, inv_K).clamp(0, self.max_depth)
 
-        if epoch < 5:
-            depth1 = upsample(d1, scale_factor=4) * self.max_depth
-            u1 = upsample(u1, scale_factor=4)
-            depth2 = upsample(depth2, scale_factor=4)
-            u2 = upsample(u2, scale_factor=4)
-            n1_norm = upsample(n1_norm, scale_factor=4)
-            distance = upsample(distance, scale_factor=4)
+        # ==========================================================
+        # 4. 融合 (Fusion)
+        # ==========================================================
+        # 将特征上采样以便融合 (如果 e0, e4 是 1/4 尺度)
+        feat_geo_up = F.interpolate(e4, scale_factor=4, mode='bilinear')
+        feat_res_up = F.interpolate(e0, scale_factor=4, mode='bilinear')
 
-            eps = 1e-6
-            # u1/u2 期望和 uncer_gt 同分布 (较大 -> 更可信)
-            w1 = u1.clamp(min=eps)
-            w2 = u2.clamp(min=eps)
-            final_depth = (w1 * depth1 + w2 * depth2) / (w1 + w2 + eps)
-
-            geo_in = torch.cat([n1_norm, distance, final_depth], dim=1)
-            # ---- 计算 R / P / DPF 拼回平面深度 ----
-            R = self.manhattan_head(geo_in)                       # (B,3,3)
-            P = self.plane_gate(geo_in)                           # (B,3,h,w) (与 geo_in 同分辨率)
-            # 若 geo_in 分辨率 < depth 分辨率，可在此上采样，这里二者一致无需上采样
-            P_full = P
-
-            # n_k, d_k, z_plane, z_k_map = self.dpf_layer(final_depth, inv_K, P_full)
-            _, _, z_plane, z_k_map = self.dpf_layer(final_depth, inv_K, P_full) 
-
-            return depth1, u1, depth2, u2, n1_norm, distance,final_depth,R,P_full,z_plane,z_k_map
+        d_final, gate_map = self.fusion_gate(feat_geo_up, feat_res_up, d_geo, d_res)
+        return d_final,d_geo,d_res,n_norm,gate_map
+        # return {
+        #         "d_final": d_final, # 最终深度
+        #         "d_geo": d_geo,     # 几何分支深度
+        #         "d_res": d_res,     # 残差分支深度
+        #         "normal": n_norm,   # 预测法线
+        #         "gate": gate_map    # 门控图 (可视化的好材料)
+        #     }
         
-        else:
-            depth1 = d1
-            depth2 = depth2 / self.max_depth
-            context = feats[0]
-            gru_hidden = torch.cat((e0, e4), 1)
-            depth1_list, depth2_list  = self.update(depth1, u1, depth2, u2, context, gru_hidden)
+        # b, c, h, w =  n1.shape  
+        # device = n1.device  
+        # dn_to_depth = DN_to_depth(b, h, w).to(device)
 
-            for i in range(len(depth1_list)):
-                depth1_list[i] = upsample(depth1_list[i], scale_factor=4) * self.max_depth
-            u1 = upsample(u1, scale_factor=4)
-            for i in range(len(depth2_list)):
-                depth2_list[i] = upsample(depth2_list[i], scale_factor=4) * self.max_depth 
-            u2 = upsample(u2, scale_factor=4)
-            n1_norm = upsample(n1_norm, scale_factor=4)
-            distance = upsample(distance, scale_factor=4)
+        # distance = dist1 * self.max_depth 
+        # n1_norm = F.normalize(n1, dim=1, p=2)
+        # depth2 = dn_to_depth(n1_norm, distance, inv_K).clamp(0, self.max_depth)
 
-            eps = 1e-6
-            # u1/u2 期望和 uncer_gt 同分布 (较大 -> 更可信)
-            w1 = u1.clamp(min=eps)
-            w2 = u2.clamp(min=eps)
-            final_depth = (w1 * depth1_list[-1] + w2 * depth2_list[-1]) / (w1 + w2 + eps)
+        # if epoch < 5:
+            
+        #     return depth1, u1, depth2, u2, n1_norm, distance,final_depth,R,P_full,z_plane,z_k_map
+        
+        # else:
+        #     depth1 = d1
+        #     depth2 = depth2 / self.max_depth
+        #     context = feats[0]
+        #     gru_hidden = torch.cat((e0, e4), 1)
+        #     depth1_list, depth2_list  = self.update(depth1, u1, depth2, u2, context, gru_hidden)
 
-            geo_in = torch.cat([n1_norm, distance, final_depth], dim=1)
-            # ---- 计算 R / P / DPF 拼回平面深度 ----
-            R = self.manhattan_head(geo_in)                       # (B,3,3)
-            P = self.plane_gate(geo_in)                           # (B,3,h,w) (与 geo_in 同分辨率)
-            # 若 geo_in 分辨率 < depth 分辨率，可在此上采样，这里二者一致无需上采样
-            P_full = P
+        #     for i in range(len(depth1_list)):
+        #         depth1_list[i] = upsample(depth1_list[i], scale_factor=4) * self.max_depth
+        #     u1 = upsample(u1, scale_factor=4)
+        #     for i in range(len(depth2_list)):
+        #         depth2_list[i] = upsample(depth2_list[i], scale_factor=4) * self.max_depth 
+        #     u2 = upsample(u2, scale_factor=4)
+        #     n1_norm = upsample(n1_norm, scale_factor=4)
+        #     distance = upsample(distance, scale_factor=4)
 
-            # n_k, d_k, z_plane, z_k_map = self.dpf_layer(final_depth, inv_K, P_full) 
-            _, _, z_plane, z_k_map = self.dpf_layer(final_depth, inv_K, P_full) 
+        #     eps = 1e-6
+        #     # u1/u2 期望和 uncer_gt 同分布 (较大 -> 更可信)
+        #     w1 = u1.clamp(min=eps)
+        #     w2 = u2.clamp(min=eps)
+        #     final_depth = (w1 * depth1_list[-1] + w2 * depth2_list[-1]) / (w1 + w2 + eps)
+
+           
 
 
             return depth1_list, u1, depth2_list, u2, n1_norm, distance, final_depth,R,P_full,z_plane,z_k_map                    
