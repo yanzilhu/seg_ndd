@@ -6,116 +6,8 @@ from .swin_transformer import SwinTransformer
 from .newcrf_layers import NewCRF
 from .uper_crf_head import PSP
 from utils import DN_to_depth
+########################################################################################################################
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-# -------------------------------------------------------------------------
-# 0. 辅助模块
-# -------------------------------------------------------------------------
-
-class PlanarFusionModule(nn.Module):
-    def __init__(self, in_channels):
-        super(PlanarFusionModule, self).__init__()
-        # 输入: [Feat_ND(C) + Feat_Reg(C) + Depth_Geo(1) + Depth_Reg(1) + Uncer_ND(1) + Uncer_Reg(1)]
-        fusion_dim = in_channels * 2 + 4 
-        
-        self.conv1 = nn.Conv2d(fusion_dim, 64, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.relu = nn.ReLU(inplace=True)
-        
-        self.conv2 = nn.Conv2d(64, 2, kernel_size=3, padding=1) # 输出两个权重 map
-        self.softmax = nn.Softmax(dim=1) # 保证权重和为1
-
-        # 为两个特征分支分别定义 BN 和 ReLU
-        self.process_nd = nn.Sequential(
-            nn.BatchNorm2d(in_channels),
-            nn.ReLU(inplace=True)
-        )
-        self.process_reg = nn.Sequential(
-            nn.BatchNorm2d(in_channels),
-            nn.ReLU(inplace=True)
-        )
-
-    def forward(self, depth_geo, depth_reg, uncer_nd, uncer_reg, feat_nd, feat_reg):
-        """
-        depth_geo, depth_reg: [B, 1, H, W]
-        uncer_nd, uncer_reg: [B, 1, H, W]
-        feat_nd, feat_reg: [B, 128, H/4, W/4] 
-        """
-        # 1. 特征对齐 (如果 feature 还是 H/4, W/4，需要上采样)
-        feat_nd = upsample(feat_nd, scale_factor=4)
-        feat_reg=upsample(feat_reg, scale_factor=4)
-        
-        feat_nd = self.process_nd(feat_nd)
-        feat_reg = self.process_reg(feat_reg)
-
-        # 2. 拼接所有信息
-
-        cat_feat = torch.cat([feat_nd, feat_reg, depth_geo, depth_reg, uncer_nd, uncer_reg], dim=1)
-        
-        # 3. 计算融合权重
-        x = self.relu(self.bn1(self.conv1(cat_feat)))
-        weights = self.softmax(self.conv2(x)) # [B, 2, H, W]
-        
-        w_geo = weights[:, 0:1, :, :]
-        w_reg = weights[:, 1:2, :, :]
-        
-        # 4. 加权融合
-        depth_final = w_geo * depth_geo + w_reg * depth_reg
-        
-        return depth_final, w_geo # 返回权重用于可视化分析
-class OffsetHead(nn.Module):
-    def __init__(self, input_dim=128):
-        super(OffsetHead, self).__init__()
-        # 预测 x 和 y 方向的偏移量
-        self.conv1 = nn.Conv2d(input_dim, 128, 3, padding=1)
-        self.bn1 = nn.BatchNorm2d(128)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(128, 2, 3, padding=1) # 输出 2 通道 (delta_x, delta_y)
-        
-        # 初始化：让初始偏移量接近 0，保证训练初期网络先学好局部特征
-        nn.init.normal_(self.conv2.weight, mean=0, std=0.001)
-        nn.init.constant_(self.conv2.bias, 0)
-
-    def forward(self, x, scale):
-        x = self.relu(self.bn1(self.conv1(x)))
-        offset = self.conv2(x)
-        if scale > 1:
-             offset = F.interpolate(offset, scale_factor=scale, mode='bilinear', align_corners=True)
-        return offset
-
-def sample_with_offset(map_to_sample, offset):
-    """
-    根据偏移量对特征图进行采样 (Grid Sample)
-    map_to_sample: [B, C, H, W] (例如法线图或距离图)
-    offset: [B, 2, H, W] (预测出的偏移量，单位是像素或归一化坐标)
-    """
-    B, _, H, W = map_to_sample.shape
-    device = map_to_sample.device
-
-    # 1. 生成基础网格 (0,0) 到 (W-1, H-1)
-    yy, xx = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
-    base_grid = torch.stack([xx, yy], dim=0).float().unsqueeze(0).repeat(B, 1, 1, 1) # [B, 2, H, W]
-
-    # 2. 加上预测的偏移量
-    # 假设 offset 输出的是像素级别的位移 (比如移动 10 个像素)
-    # 如果 offset 输出范围较大，建议加个 tanh * max_offset 限制
-    sample_coords = base_grid + offset 
-
-    # 3. 归一化到 [-1, 1] 用于 grid_sample
-    # X 轴归一化: 2 * x / (W-1) - 1
-    # Y 轴归一化: 2 * y / (H-1) - 1
-    norm_coords = torch.stack([
-        2.0 * sample_coords[:, 0] / (W - 1) - 1.0,
-        2.0 * sample_coords[:, 1] / (H - 1) - 1.0
-    ], dim=3) # [B, H, W, 2]
-
-    # 4. 采样
-    # padding_mode='border' 意味着如果指到了图像外面，就用边缘的值
-    sampled_map = F.grid_sample(map_to_sample, norm_coords, mode='bilinear', padding_mode='border', align_corners=True)
-    
-    return sampled_map
 
 class NewCRFDepth(nn.Module):
     """
@@ -180,7 +72,6 @@ class NewCRFDepth(nn.Module):
         crf_dims = [128, 256, 512, 1024]
         v_dims = [64, 128, 256, embed_dim]
         
-        # --------
         # depth
         self.crf3 = NewCRF(input_dim=in_channels[3], embed_dim=crf_dims[3], window_size=win, v_dim=v_dims[3], num_heads=32)
         self.crf2 = NewCRF(input_dim=in_channels[2], embed_dim=crf_dims[2], window_size=win, v_dim=v_dims[2], num_heads=16)
@@ -203,7 +94,7 @@ class NewCRFDepth(nn.Module):
         self.crf6 = NewCRF(input_dim=in_channels[2], embed_dim=crf_dims[2], window_size=win, v_dim=v_dims[2], num_heads=16)
         self.crf5 = NewCRF(input_dim=in_channels[1], embed_dim=crf_dims[1], window_size=win, v_dim=v_dims[1], num_heads=8)
         self.crf4 = NewCRF(input_dim=in_channels[0], embed_dim=crf_dims[0], window_size=win, v_dim=v_dims[0], num_heads=4)
-        self.decoder_geo = PSP(**decoder_cfg)
+
         self.decoder2 = PSP(**decoder_cfg)
 
         self.normal_head1 = NormalHead(input_dim=crf_dims[0])
@@ -217,15 +108,11 @@ class NewCRFDepth(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Conv2d(64, 16*9, 1, padding=0))
             
+        self.update = BasicUpdateBlockDepth()
+
         self.min_depth = min_depth
         self.max_depth = max_depth
 
-        # --- 融合模块 ---
-        self.fusion_module=PlanarFusionModule(in_channels=128)
-
-        # self.dn2depth = DN_to_depth()
-        self.dn_to_depth_layer = DN_to_depth()
-        self.offset_head = OffsetHead(input_dim=crf_dims[0])
         self.init_weights(pretrained=pretrained)
 
     def init_weights(self, pretrained=None):
@@ -266,7 +153,8 @@ class NewCRFDepth(nn.Module):
         up_disp = up_disp.permute(0, 1, 4, 2, 5, 3)
         return up_disp.reshape(N, 1, 4*H, 4*W)
 
-    def forward(self, imgs, inv_K, epoch):        
+    def forward(self, imgs, inv_K, epoch):
+        
         feats = self.backbone(imgs)
 
         if self.with_neck:
@@ -283,6 +171,15 @@ class NewCRFDepth(nn.Module):
         e1 = nn.PixelShuffle(2)(e1)
         e0 = self.crf0(feats[0], e1)
 
+        if self.up_mode == 'mask':
+            mask = self.mask_head(e0)
+            d1 = self.disp_head1(e0, 1)
+            u1 = self.uncer_head1(e0, 1)
+            d1 = self.upsample_mask(d1, mask)
+            u1 = self.upsample_mask(u1, mask)
+        else:
+            d1 = self.disp_head1(e0, 1)
+            u1 = self.uncer_head1(e0, 1)
 
         # normal and distance
         ppm_out2 = self.decoder2(feats)
@@ -295,64 +192,66 @@ class NewCRFDepth(nn.Module):
         e5 = nn.PixelShuffle(2)(e5)
         e4 = self.crf4(feats[0], e5)
 
-        local_normal = self.normal_head1(e4, scale=4) 
-        local_normal = F.normalize(local_normal, dim=1, p=2) # 归一化非常重要
-        
-        # 距离预测 (0, 1) -> 映射到物理尺度
-        local_distance = self.distance_head1(e4, scale=4)
-        local_distance = local_distance * self.max_depth # 映射到最大深度范围
-        
-        # 不确定性预测 (0, 1)
-        pred_uncertainty_nd = self.uncer_head2(e4, scale=4)
-
-        # version 2
-        offset = self.offset_head(e4, scale=4) # [B, 2, H, W]
-
-        # 利用 offset 去采样“更可靠”的平面参数
-        seed_normal = sample_with_offset(local_normal, offset)
-        seed_distance = sample_with_offset(local_distance, offset)
-        seed_normal = F.normalize(seed_normal, dim=1, p=2)
-            # 4. 几何深度合成 (ND -> Depth)
-        # b, c, h, w = pred_normal.shape
-        # device = pred_normal.device
-        
-        # 计算 D_geo = d / (n^T * K^-1 * p)
-        depth_geo = self.dn_to_depth_layer(seed_normal, seed_distance, inv_K)
-        depth_geo = depth_geo.clamp(self.min_depth, self.max_depth)
-
-        # return depth_geo, pred_normal, pred_distance, pred_uncertainty_nd, e4
-        # 非平面----------------------------------------
 
         # 3. Head 预测
-        # 预测归一化的视差 (0, 1) 或者 深度
-        # 如果是 DispHead，通常预测的是 sigmoid 输出
-        pred_disp_reg = self.disp_head1(e0, scale=4)
-        # 视差转深度: depth = 1 / (disp + epsilon) 或者按照 min/max 映射
-        # 这里使用常见的线性映射反转:
-        # D = min_depth + (max_depth - min_depth) * disp (如果是深度头)
-        # 或者 D = 1 / (min_disp + (max_disp - min_disp) * disp) (如果是视差头)
-        # 假设 DispHead 输出的是 0-1 的相对深度:
-        depth_reg = pred_disp_reg * self.max_depth
-        depth_reg = depth_reg.clamp(self.min_depth, self.max_depth)
+        # 预测法线 [B, 3, H, W] (注意：这里假设 head 内部处理了上采样到原图尺寸，或者在这里做)
+        # 通常 head 输出 scale=1 (原图) 或者 scale=4 (特征图)
+        # 这里假设 head 输出与输入同尺寸，后续统一上采样到原图
         
-        # 不确定性预测
-        pred_uncertainty_reg = self.uncer_head1(e0, scale=4)
+        # 法线预测 (-1, 1)
+        pred_normal = self.normal_head1(e4, scale=4) 
+        pred_normal = F.normalize(pred_normal, dim=1, p=2) # 归一化非常重要
 
-        d_final, w_geo = self.fusion_module(depth_geo/self.max_depth, depth_reg/self.max_depth, pred_uncertainty_nd, pred_uncertainty_reg, e4, e0)
-
-        d_final=d_final*self.max_depth
         
-        return d_final,depth_geo,depth_reg,seed_normal,seed_distance,w_geo,pred_uncertainty_nd,pred_uncertainty_reg
-        # 4. Pack output
-            # outputs = {
-            #     'depth_final': d_final,
-            #     'depth_geo': d_geo,
-            #     'depth_reg': d_reg,
-            #     'pred_normal': n_pred,
-            #     'pred_distance': dist_pred,
-            #     'w_geo': w_geo
-            # }
-      
+
+        if self.up_mode == 'mask':
+            mask2 = self.mask_head2(e4)
+            n1 = self.normal_head1(e4, 1)
+            dist1 = self.distance_head1(e4, 1)
+            u2 = self.uncer_head2(e4, 1)
+            n1 = self.upsample_mask(n1, mask2)
+            dist1 = self.upsample_mask(dist1, mask2)
+            u2 = self.upsample_mask(u2, mask2)
+        else:
+            n1 = self.normal_head1(e4, 1)
+            dist1 = self.distance_head1(e4, 1)
+            u2 = self.uncer_head2(e4, 1)
+
+        b, c, h, w =  n1.shape 
+        device = n1.device  
+        dn_to_depth = DN_to_depth(b, h, w).to(device)
+
+        distance = dist1 * self.max_depth 
+        n1_norm = F.normalize(n1, dim=1, p=2)
+        depth2 = dn_to_depth(n1_norm, distance, inv_K).clamp(0, self.max_depth)
+        
+        if epoch < 5:
+            depth1 = upsample(d1, scale_factor=4) * self.max_depth
+            u1 = upsample(u1, scale_factor=4)
+            depth2 = upsample(depth2, scale_factor=4)
+            u2 = upsample(u2, scale_factor=4)
+            n1_norm = upsample(n1_norm, scale_factor=4)
+            distance = upsample(distance, scale_factor=4)
+
+            return depth1, u1, depth2, u2, n1_norm, distance
+        
+        else:
+            depth1 = d1
+            depth2 = depth2 / self.max_depth
+            context = feats[0]
+            gru_hidden = torch.cat((e0, e4), 1)
+            depth1_list, depth2_list  = self.update(depth1, u1, depth2, u2, context, gru_hidden)
+
+            for i in range(len(depth1_list)):
+                depth1_list[i] = upsample(depth1_list[i], scale_factor=4) * self.max_depth
+            u1 = upsample(u1, scale_factor=4)
+            for i in range(len(depth2_list)):
+                depth2_list[i] = upsample(depth2_list[i], scale_factor=4) * self.max_depth 
+            u2 = upsample(u2, scale_factor=4)
+            n1_norm = upsample(n1_norm, scale_factor=4)
+            distance = upsample(distance, scale_factor=4)
+
+            return depth1_list, u1, depth2_list, u2, n1_norm, distance                                                     
                     
 class DispHead(nn.Module):
     def __init__(self, input_dim=100):

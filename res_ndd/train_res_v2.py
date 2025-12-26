@@ -5,7 +5,8 @@ import torch.nn.utils as utils
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 import torch.multiprocessing as mp
-
+import numpy; print(numpy.__version__)
+import math
 import os, sys, time
 from telnetlib import IP
 import argparse
@@ -16,9 +17,11 @@ from tensorboardX import SummaryWriter
 
 from utils import post_process_depth, flip_lr, silog_loss, DN_to_distance, DN_to_depth, colormap, colormap_magma, colormap_viridis, compute_errors, eval_metrics, \
                        block_print, enable_print, normalize_result, inv_normalize, convert_arg_line_to_args, compute_seg, get_smooth_ND, normalize_image
-from networks.NewCRFDepth_ori import NewCRFDepth
+# from networks.NewCRFDepth import NewCRFDepth
+from networks.NewCRFDepth_res import NewCRFDepth
 from datetime import datetime
 
+# from skimage.segmentation import all_felzenszwalb as felz_seg
 
 parser = argparse.ArgumentParser(description='NDDepth PyTorch implementation.', fromfile_prefix_chars='@')
 parser.convert_arg_line_to_args = convert_arg_line_to_args
@@ -81,7 +84,99 @@ parser.add_argument('--eigen_crop',                            help='if set, cro
 parser.add_argument('--garg_crop',                             help='if set, crops according to Garg  ECCV16', action='store_true')
 parser.add_argument('--eval_freq',                 type=int,   help='Online evaluation frequency in global steps', default=500)
 parser.add_argument('--eval_summary_directory',    type=str,   help='output directory for eval summary,'
-                                                                    'if empty outputs to checkpoint folder', default='')
+                                                                 'if empty outputs to checkpoint folder', default='')
+parser.add_argument('--accumulation_steps',        type=int,   help='gradient accumulation steps', default=1)
+
+import matplotlib.pyplot as plt
+# 修改后：
+# 1. 生成平面 Mask (简单版：利用 GT 法线和视线的夹角，或者利用 GT 梯度的平滑度)
+# 这里假设你没有额外的平面标签，我们用简单的梯度阈值来过滤掉边缘
+def gradient(x):
+        # 计算 x 方向梯度: I(x+1) - I(x)
+        # 计算 y 方向梯度: I(y+1) - I(y)
+        # h_x = x.size()[2]
+        # w_x = x.size()[3]
+        
+        # 为了保证维度对齐，我们在最后一行/列补零，或者切片时对齐
+        # 这里采用切片对齐方式：
+        # grad_x: [:, :, :, :-1]
+        grad_x = torch.abs(x[:, :, :, :-1] - x[:, :, :, 1:])
+        grad_y = torch.abs(x[:, :, :-1, :] - x[:, :, 1:, :])
+        
+        return grad_x, grad_y
+#  ai studio 有根据法线和距离的准则
+
+def get_planar_mask(depth_gt):
+    grad_x, grad_y= gradient(depth_gt)
+    grad_x = F.pad(grad_x, (0, 1, 0, 0), mode='constant', value=0)
+    grad_y = F.pad(grad_y, (0, 0, 0, 1), mode='constant', value=0)
+     # 你得有个算梯度的函数
+    grad_mag = torch.sqrt(grad_x**2 + grad_y**2)
+    # 梯度小的地方认为是平面
+    planar_mask = grad_mag < 0.5 # 阈值需要根据数据调整
+    return planar_mask
+
+
+def save_w_geo_heatmap(w_geo, save_dir, step, img_idx_offset=0, cmap='jet'):
+    """
+    专门保存w_geo的热力图（直观展示权重分布，红=高权重，蓝=低权重）
+    Args:
+        w_geo: 权重张量，shape=[B,1,H,W]（GPU/CPU均可）
+        save_dir: 热力图保存目录（自动创建）
+        epoch: 训练轮数（用于文件名）
+        batch_idx: 批次索引（用于文件名）
+        img_idx_offset: 图片索引偏移（避免多批次索引重复）
+        cmap: 热力图配色方案（jet/rainbow/viridis等，推荐jet）
+    """
+    # 1. 创建保存目录
+    # os.makedirs(save_dir, exist_ok=True)
+    
+    # 2. 处理张量：GPU→CPU → 去通道维度 → 转numpy → 确保值在0~1（Softmax输出已满足）
+    w_geo_np = w_geo.detach().cpu().squeeze(1).numpy()  # [B, H, W]
+    
+    # 3. 批量保存每张图的热力图
+    batch_size = w_geo_np.shape[0]
+    filename = f"w_geo_heatmap_epoch{step}.png"
+    save_path = os.path.join(save_dir, filename)
+    
+        
+        # 4. 绘制并保存热力图（无需归一化，w_geo本身是0~1）
+    plt.imsave(
+        save_path,
+            w_geo_np[0],          # 当前图片的权重矩阵 [H, W]
+            cmap=cmap,            # 配色方案（jet：蓝→青→黄→红，红=高权重）
+            vmin=0.0,             # 最小值（对应蓝）
+            vmax=1.0,             # 最大值（对应红）
+            dpi=150               # 分辨率（越高越清晰）
+        )
+    # print(f"已保存{batch_size}张w_geo热力图到：{save_dir}")
+
+# 辅助类：梯度损失
+class GradientLoss(nn.Module):
+    def __init__(self):
+        super(GradientLoss, self).__init__()
+    
+    def forward(self, pred, target, mask):
+        # 计算 x 和 y 方向梯度
+        pred_dy, pred_dx = self.gradient(pred)
+        target_dy, target_dx = self.gradient(target)
+        
+        # 梯度差的 L1 Loss
+        loss = torch.mean(torch.abs(pred_dy[mask] - target_dy[mask])) + \
+               torch.mean(torch.abs(pred_dx[mask] - target_dx[mask]))
+        return loss
+
+    def gradient(self, x):
+        # 简单的 Sobel 或者 差分
+        h_x = x.size()[-2]
+        w_x = x.size()[-1]
+        r = F.pad(x, (0, 1, 0, 0))[:, :, :, 1:]
+        l = F.pad(x, (1, 0, 0, 0))[:, :, :, :w_x]
+        t = F.pad(x, (0, 0, 1, 0))[:, :, :h_x, :]
+        b = F.pad(x, (0, 0, 0, 1))[:, :, 1:, :]
+        xgrad = torch.pow(torch.pow((r - l) * 0.5, 2) + 1e-6, 0.5)
+        ygrad = torch.pow(torch.pow((t - b) * 0.5, 2) + 1e-6, 0.5)
+        return ygrad, xgrad
 
 if sys.argv.__len__() == 2:
     arg_filename_with_prefix = '@' + sys.argv[1]
@@ -94,6 +189,11 @@ if args.dataset == 'kitti' or args.dataset == 'nyu':
 
 def online_eval(model, dataloader_eval, gpu, ngpus, group, epoch, post_process=False):
 
+    # 创建保存可视化结果的文件夹 (建议)
+    # vis_dir = f"./vis_results/epoch_{epoch}"
+    # if not os.path.exists(vis_dir):
+    #     os.makedirs(vis_dir)
+
     eval_measures = torch.zeros(10).cuda(device=gpu)
     for _, eval_sample_batched in enumerate(tqdm(dataloader_eval.data)):
         with torch.no_grad():
@@ -104,20 +204,13 @@ def online_eval(model, dataloader_eval, gpu, ngpus, group, epoch, post_process=F
 
             image = torch.autograd.Variable(eval_sample_batched['image'].cuda(gpu, non_blocking=True))
             inv_K = torch.autograd.Variable(eval_sample_batched['inv_K'].cuda(gpu, non_blocking=True))
-            depth1_list, uncer1_list, depth2_list, uncer2_list, _, _ = model(image, inv_K, epoch)
-            if epoch < 5:
-                pred_depth = 0.5 * (depth1_list + depth2_list)
-            else:
-                pred_depth = 0.5 * (depth1_list[-1] + depth2_list[-1])
-            if post_process:
-                image_flipped = flip_lr(image)
-                depth1_list_flipped, uncer1_list_flipped, depth2_list_flipped, uncer2_list_flipped, _, _ = model(image_flipped, inv_K, epoch)
-                if epoch < 5:
-                    pred_depth_flipped = 0.5 * (depth1_list_flipped + depth2_list_flipped)
-                else:
-                    pred_depth_flipped = 0.5 * (depth1_list_flipped[-1] + depth2_list_flipped[-1])
-                pred_depth = post_process_depth(pred_depth, pred_depth_flipped)
-
+            d_final,_,_,_,_,_,_,_=model(image, inv_K, epoch)
+            # d_final,depth_geo,depth_reg,pred_normal,pred_distance,w_geo=model(image, inv_K, epoch)
+            pred_depth=d_final
+            # if post_process:
+            #     image_flipped = flip_lr(image)
+            #     depth1_flipped, u1_flipped, depth2_flipped, u2_flipped, n1_norm_flipped, distance_flipped,final_depth_flipped,_,_,_= model(image_flipped, inv_K, epoch)
+            #     pred_depth = post_process_depth(final_depth, depth1_flipped)
             pred_depth = pred_depth.cpu().numpy().squeeze()
             gt_depth = gt_depth.cpu().numpy().squeeze()
 
@@ -156,11 +249,12 @@ def online_eval(model, dataloader_eval, gpu, ngpus, group, epoch, post_process=F
         eval_measures[:9] += torch.tensor(measures).cuda(device=gpu)
         eval_measures[9] += 1
 
-    if args.multiprocessing_distributed:
-        # group = dist.new_group([i for i in range(ngpus)])
-        dist.all_reduce(tensor=eval_measures, op=dist.ReduceOp.SUM, group=group)
+    # if args.multiprocessing_distributed:
+    #     # group = dist.new_group([i for i in range(ngpus)])
+    #     dist.all_reduce(tensor=eval_measures, op=dist.ReduceOp.SUM, group=group)
 
-    if not args.multiprocessing_distributed or gpu == 0:
+    # if not args.multiprocessing_distributed or 
+    if gpu == 0:
         eval_measures_cpu = eval_measures.cpu()
         cnt = eval_measures_cpu[9].item()
         eval_measures_cpu /= cnt
@@ -175,7 +269,7 @@ def online_eval(model, dataloader_eval, gpu, ngpus, group, epoch, post_process=F
 
     return None
 
-
+scaler = torch.amp.GradScaler("cuda")
 def main_worker(gpu, ngpus_per_node, args):
     args.gpu = gpu
 
@@ -193,6 +287,7 @@ def main_worker(gpu, ngpus_per_node, args):
     model = NewCRFDepth(version=args.encoder, inv_depth=False, max_depth=args.max_depth, pretrained=args.pretrain, mode='triple')
     model.train()
 
+    
     num_params = sum([np.prod(p.size()) for p in model.parameters()])
     print("== Total number of parameters: {}".format(num_params))
 
@@ -211,6 +306,9 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         model = torch.nn.DataParallel(model)
         model.cuda()
+    # if int(torch.__version__.split('.')[0]) >= 2:
+    #     print("== Using torch.compile for acceleration")
+    #     model = torch.compile(model)
 
     if args.distributed:
         print("== Model Initialized on GPU: {}".format(args.gpu))
@@ -226,15 +324,20 @@ def main_worker(gpu, ngpus_per_node, args):
     optimizer = torch.optim.Adam([{'params': model.module.parameters()}],
                                 lr=args.learning_rate)
 
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
     model_just_loaded = False
     if args.checkpoint_path != '':
         if os.path.isfile(args.checkpoint_path):
             print("== Loading checkpoint '{}'".format(args.checkpoint_path))
             if args.gpu is None:
-                checkpoint = torch.load(args.checkpoint_path)
+                checkpoint = torch.load(args.checkpoint_path,weights_only=False)
             else:
                 loc = 'cuda:{}'.format(args.gpu)
-                checkpoint = torch.load(args.checkpoint_path, map_location=loc)
+                checkpoint = torch.load(args.checkpoint_path, map_location=loc,weights_only=False)
             model.load_state_dict(checkpoint['model'])
             optimizer.load_state_dict(checkpoint['optimizer'])
             if not args.retrain:
@@ -257,11 +360,6 @@ def main_worker(gpu, ngpus_per_node, args):
     dataloader = NewDataLoader(args, 'train')
     dataloader_eval = NewDataLoader(args, 'online_eval')
 
-    # ===== Evaluation before training ======
-    # model.eval()
-    # with torch.no_grad():
-    #     eval_measures = online_eval(model, dataloader_eval, gpu, ngpus_per_node, post_process=True)
-
     # Logging
     if not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
         writer = SummaryWriter(args.log_directory + '/' + args.model_name + '/summaries', flush_secs=30)
@@ -273,9 +371,11 @@ def main_worker(gpu, ngpus_per_node, args):
             eval_summary_writer = SummaryWriter(eval_summary_path, flush_secs=30)
 
     silog_criterion = silog_loss(variance_focus=args.variance_focus)
-    dn_to_depth = DN_to_depth(args.batch_size, args.input_height, args.input_width).cuda(args.gpu)
+    # 修改
+    # dn_to_depth = DN_to_depth(args.batch_size, args.input_height, args.input_width).cuda(args.gpu)
+    dn_to_depth=DN_to_depth().cuda(args.gpu)
     dn_to_distance = DN_to_distance(args.batch_size, args.input_height, args.input_width).cuda(args.gpu)
-
+    gradient_Loss = GradientLoss()
     start_time = time.time()
     duration = 0
 
@@ -287,24 +387,26 @@ def main_worker(gpu, ngpus_per_node, args):
     var_sum = np.sum(var_sum)
 
     print("== Initial variables' sum: {:.3f}, avg: {:.3f}".format(var_sum, var_sum/var_cnt))
+    print("== Using gradient accumulation with {} steps".format(args.accumulation_steps))
 
     steps_per_epoch = len(dataloader.data)
     num_total_steps = args.num_epochs * steps_per_epoch
     epoch = global_step // steps_per_epoch
-    
+   
     if args.multiprocessing_distributed:
         group = dist.new_group([i for i in range(ngpus_per_node)])
+    save_dir="result/w_geo_norm"
+    os.makedirs(save_dir, exist_ok=True)
     while epoch < args.num_epochs:
         if args.distributed:
             dataloader.train_sampler.set_epoch(epoch)
 
         for step, sample_batched in enumerate(dataloader.data):
+            optimizer.zero_grad()
 
             loss = 0
-            loss_depth1 = 0
-            loss_depth2 = 0
-
-            optimizer.zero_grad()
+            # loss_depth1 = 0
+            # loss_depth2 = 0
 
             before_op_time = time.time()
 
@@ -313,67 +415,68 @@ def main_worker(gpu, ngpus_per_node, args):
             normal_gt = torch.autograd.Variable(sample_batched['normal'].cuda(args.gpu, non_blocking=True))
             inv_K = torch.autograd.Variable(sample_batched['inv_K'].cuda(args.gpu, non_blocking=True))
             inv_K_p = torch.autograd.Variable(sample_batched['inv_K_p'].cuda(args.gpu, non_blocking=True))
-
-            depth1_list, uncer1_list, depth2_list, uncer2_list, normal_est_norm, distance_est = model(image, inv_K, epoch)
-
-            if args.dataset == 'nyu':
-                mask = depth_gt > 0.1
-            else:
-                mask = depth_gt > 1.0
             
-            normal_gt = torch.stack([normal_gt[:, 0], normal_gt[:, 2], normal_gt[:, 1]], 1)
-            normal_gt_norm = F.normalize(normal_gt, dim=1, p=2)
-            distance_gt = dn_to_distance(depth_gt, normal_gt_norm, inv_K_p)
+            # 注意：forward 返回值顺序变了，要对应上
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                d_final,depth_geo,depth_reg,pred_normal,pred_distance,w_geo,u_nd,u_reg=model(image, inv_K, epoch)
+                if args.dataset == 'nyu':
+                    mask = depth_gt > 0.1
+                else:
+                    mask = depth_gt > 1.0
 
-            if epoch < 5:
-                uncer1_gt = torch.exp(-5 * torch.abs(depth_gt - depth1_list.detach()) / (depth_gt + depth1_list.detach() + 1e-7))
-                uncer2_gt = torch.exp(-5 * torch.abs(depth_gt - depth2_list.detach()) / (depth_gt + depth2_list.detach() + 1e-7))
+
+                normal_gt = torch.stack([normal_gt[:, 0], normal_gt[:, 2], normal_gt[:, 1]], 1)
+                normal_gt_norm = F.normalize(normal_gt, dim=1, p=2)
+                distance_gt = dn_to_distance(depth_gt, normal_gt_norm, inv_K_p)
+
+
+                loss_depth_final=silog_criterion.forward(d_final, depth_gt, mask)
+                loss_depth_geo =silog_criterion.forward(depth_geo, depth_gt, mask)
+                loss_depth_reg  =silog_criterion.forward(depth_reg, depth_gt, mask)
+
+                # --- B. 显式几何监督 (Normal & Distance) ---
+                # 需要从 Depth GT 生成 Normal GT 和 Distance GT (Ground Truth Generation)
+                # 这通常在 Dataloader 里做，或者在这里动态计算
+                # 假设 targets 中已经有了由 GT Depth 生成的 pseudo-GT
+                loss_normal = 5 * ((1 - (normal_gt_norm * pred_normal).sum(1, keepdim=True)) * mask.float()).sum() / (mask.float() + 1e-7).sum()
                 
-                loss_depth1 = silog_criterion.forward(depth1_list, depth_gt, mask.to(torch.bool))
-                loss_uncer1 = torch.abs(uncer1_list[mask.to(torch.bool)]-uncer1_gt[mask.to(torch.bool)]).mean()
-                loss_depth2 = silog_criterion.forward(depth2_list, depth_gt, mask.to(torch.bool))
-                loss_uncer2 = torch.abs(uncer2_list[mask.to(torch.bool)]-uncer2_gt[mask.to(torch.bool)]).mean()
+                valid_mask = mask & get_planar_mask(depth_gt) # 只在平坦区域监督距离
+                # 修改前
+                # loss_distance = 0.25 * torch.abs(distance_gt[mask] - pred_distance[mask]).mean()
 
-                loss_depth1_0 = 0
-                loss_depth2_0 = 0
+                if valid_mask.sum() > 0:
+                    loss_distance = 0.25 * torch.abs(distance_gt[valid_mask] - pred_distance[valid_mask]).mean()
+                else:
+                    loss_distance = 0.0
 
-                weights_sum = 1
-            else:
-                uncer1_gt = torch.exp(-5 * torch.abs(depth_gt - depth1_list[0].detach()) / (depth_gt + depth1_list[0].detach() + 1e-7))
-                uncer2_gt = torch.exp(-5 * torch.abs(depth_gt - depth2_list[0].detach()) / (depth_gt + depth2_list[0].detach() + 1e-7))
-                
-                loss_uncer1 = torch.abs(uncer1_list[mask.to(torch.bool)]-uncer1_gt[mask.to(torch.bool)]).mean()
-                loss_uncer2 = torch.abs(uncer2_list[mask.to(torch.bool)]-uncer2_gt[mask.to(torch.bool)]).mean()
-                
-                loss_depth1_0 = silog_criterion.forward(depth1_list[0], depth_gt, mask.to(torch.bool))
-                loss_depth2_0 = silog_criterion.forward(depth2_list[0], depth_gt, mask.to(torch.bool))
+                # 不确定性监督
+                uncer1_gt = torch.exp(-5 * torch.abs(depth_gt - loss_depth_geo.detach()) / (depth_gt + loss_depth_geo.detach() + 1e-7))
+                uncer2_gt = torch.exp(-5 * torch.abs(depth_gt - loss_depth_reg.detach()) / (depth_gt + loss_depth_reg.detach() + 1e-7))
+                loss_uncer1 = torch.abs(u_nd[mask.to(torch.bool)]-uncer1_gt[mask.to(torch.bool)]).mean()
+                loss_uncer2 = torch.abs(u_reg[mask.to(torch.bool)]-uncer2_gt[mask.to(torch.bool)]).mean()
 
-                weights_sum = 0
-                for i in range(len(depth1_list) - 1):
-                    loss_depth1 += (0.85**(len(depth1_list)-i-2)) * silog_criterion.forward(depth1_list[i + 1], depth_gt, mask.to(torch.bool))
-                    loss_depth2 += (0.85**(len(depth1_list)-i-2)) * silog_criterion.forward(depth2_list[i + 1], depth_gt, mask.to(torch.bool))
-                    
-                    weights_sum += 0.85**(len(depth1_list)-i-2)
+                loss_grad =gradient_Loss.forward(d_final, depth_gt, mask)
 
-            loss_normal = 5 * ((1 - (normal_gt_norm * normal_est_norm).sum(1, keepdim=True)) * mask.float()).sum() / (mask.float() + 1e-7).sum()
-            loss_distance = 0.25 * torch.abs(distance_gt[mask] - distance_est[mask]).mean()
+                loss= loss_depth_final+0.5 * loss_depth_geo +0.5 * loss_depth_reg+loss_uncer1 + loss_uncer2 \
+                    + loss_normal+0.01*loss_distance+0.01* loss_grad
 
-            segment, planar_mask, dissimilarity_map = compute_seg(image, normal_est_norm, distance_est[:, 0])
-            loss_grad_normal, loss_grad_distance = get_smooth_ND(normal_est_norm, distance_est, planar_mask)
-
-            loss = (loss_depth1 + loss_depth2) / weights_sum + loss_depth1_0 + loss_depth2_0 + loss_uncer1 + loss_uncer2 + loss_normal + loss_distance + 0.01 * loss_grad_normal + 0.01 * loss_grad_distance
-
-            loss.backward()
+            
+            # loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=10, norm_type=2)
 
             for param_group in optimizer.param_groups:
                 current_lr = (args.learning_rate - end_learning_rate) * (1 - global_step / num_total_steps) ** 0.9 + end_learning_rate
                 param_group['lr'] = current_lr
             
-            optimizer.step()
+            # optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             if not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
-                print('[epoch][s/s_per_e/gs]: [{}][{}/{}/{}], lr: {:.12f}, loss: {:.12f}'.format(epoch, step, steps_per_epoch, global_step, current_lr, loss))
+                if global_step % 10 == 0:
+                    print('[epoch][s/s_per_e/gs]: [{}][{}/{}/{}], lr: {:.12f}, loss: {:.12f}'.format(epoch, step, steps_per_epoch, global_step, current_lr, loss))
                 if np.isnan(loss.cpu().item()):
                     print('NaN in loss occurred. Aborting training.')
                     return -1
@@ -394,14 +497,18 @@ def main_worker(gpu, ngpus_per_node, args):
 
                 if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                                                             and args.rank % ngpus_per_node == 0):
-                    writer.add_scalar('silog_loss', (loss_depth1 + loss_depth2) / weights_sum + (loss_depth1_0 + loss_depth2_0), global_step)
-                    writer.add_scalar('uncer_loss', (loss_uncer1 + loss_uncer2), global_step)
-                    writer.add_scalar('normal_loss', loss_normal, global_step)
-                    writer.add_scalar('grad_normal_loss', loss_grad_normal, global_step)
-                    writer.add_scalar('distance_loss', loss_distance, global_step)
-                    writer.add_scalar('grad_distance_loss', loss_grad_distance, global_step)
-                    writer.add_scalar('learning_rate', current_lr, global_step)
-                    writer.add_scalar('var average', var_sum.item()/var_cnt, global_step)
+                    writer.add_scalar('loss', loss, global_step)
+                    writer.add_scalar('loss_depth_final', loss_depth_final , global_step)
+                    writer.add_scalar('loss_depth_geo', loss_depth_geo, global_step)
+                    writer.add_scalar('loss_depth_reg', loss_depth_reg, global_step)
+                    writer.add_scalar('loss_normal', loss_normal, global_step)
+                    writer.add_scalar('loss_distance', loss_distance, global_step)
+                    writer.add_scalar('loss_grad', loss_grad, global_step)
+
+                    # writer.add_scalar('learning_rate', current_lr, global_step)
+                    # writer.add_scalar('var average', var_sum.item()/var_cnt, global_step)
+                    # # writer.add_scalar('loss_gate', loss_gate, global_step)
+                    # writer.add_scalar('loss_geom', loss_geom, global_step)
 
                     writer.flush()
 
@@ -409,7 +516,9 @@ def main_worker(gpu, ngpus_per_node, args):
                 time.sleep(0.1)
                 model.eval()
                 with torch.no_grad():
-                    eval_measures = online_eval(model, dataloader_eval, gpu, ngpus_per_node, group, epoch, post_process=True)
+                    # eval_measures = online_eval(model, dataloader_eval, gpu, ngpus_per_node, group, epoch, post_process=True)
+                    eval_measures = online_eval(model, dataloader_eval, gpu, ngpus_per_node, group, epoch, post_process=False)
+                    save_w_geo_heatmap(w_geo,save_dir,global_step)
                 if eval_measures is not None:
                     exp_name = '%s'%(datetime.now().strftime('%m%d'))
                     log_txt = os.path.join(args.log_directory + '/' + args.model_name, exp_name+'_logs.txt')
@@ -466,7 +575,7 @@ def main_worker(gpu, ngpus_per_node, args):
     if not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
         writer.close()
         if args.do_online_eval:
-            eval_summary_writer.close()
+            eval_summary_writer.close()   
 
 
 def main():
@@ -488,11 +597,23 @@ def main():
         aux_out_path = os.path.join(args.log_directory, args.model_name)
         networks_savepath = os.path.join(aux_out_path, 'networks')
         dataloaders_savepath = os.path.join(aux_out_path, 'dataloaders')
-        command = 'cp nddepth/train.py ' + aux_out_path
+
+        # ===== 核心修改：动态获取当前文件夹路径 =====
+        current_script = sys.argv[0]  # 当前执行的脚本路径（如 ./train.py 或 /a/b/train.py）
+        current_dir = os.path.dirname(os.path.abspath(current_script))  # 当前脚本所在文件夹的绝对路径
+        # 若 networks/dataloaders 在当前文件夹下，直接拼接
+        networks_src = os.path.join(current_dir, 'networks', '*.py')
+        dataloaders_src = os.path.join(current_dir, 'dataloaders', '*.py')
+
+        # 复制当前执行脚本（原有逻辑）
+        script_name = os.path.basename(current_script)
+        command = f'cp {current_script} {os.path.join(aux_out_path, script_name)}'
         os.system(command)
-        command = 'mkdir -p ' + networks_savepath + ' && cp nddepth/networks/*.py ' + networks_savepath
+
+        # ===== 替换硬编码的 nddepth，使用动态路径 =====
+        command = f'mkdir -p {networks_savepath} && cp {networks_src} {networks_savepath}'
         os.system(command)
-        command = 'mkdir -p ' + dataloaders_savepath + ' && cp nddepth/dataloaders/*.py ' + dataloaders_savepath
+        command = f'mkdir -p {dataloaders_savepath} && cp {dataloaders_src} {dataloaders_savepath}'
         os.system(command)
 
     torch.cuda.empty_cache()

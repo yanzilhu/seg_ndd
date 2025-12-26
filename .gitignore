@@ -24,3 +24,5 @@ events.out.tfevents.*
 mytest/
 img/
 result/
+test_img/
+vis_results

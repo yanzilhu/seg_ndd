@@ -12,4 +12,4 @@
 --max_depth_eval 10
 --eigen_crop
 
---checkpoint_path debug_models/1214/nddepth_nyu_debug/model-50000-best_rms_0.33106
+--checkpoint_path result/bin/1223/nddepth_nyu_debug/model-110000-best_rms_0.31940

@@ -167,235 +167,6 @@ def get_planar_mask(depth_gt):
     return planar_mask
 
 
-def normal_consistency_mask(normals, thresh=0.99):
-    """
-    normals: [B, 3, H, W] normalized
-    """
-    n = F.normalize(normals, dim=1)
-
-    nx = torch.abs((n[:, :, :, :-1] * n[:, :, :, 1:]).sum(1))
-    ny = torch.abs((n[:, :, :-1, :] * n[:, :, 1:, :]).sum(1))
-
-    nx = F.pad(nx, (0, 1, 0, 0), value=1)
-    ny = F.pad(ny, (0, 0, 0, 1), value=1)
-
-    normal_mask = (nx > thresh) & (ny > thresh)
-    return normal_mask
-
-
-def depth_normal_consistency(depth, normals, thresh=0.01):
-    dzdx = depth[:, :, :, 1:] - depth[:, :, :, :-1]
-    dzdy = depth[:, :, 1:, :] - depth[:, :, :-1, :]
-
-    dzdx = F.pad(dzdx, (0, 1, 0, 0))
-    dzdy = F.pad(dzdy, (0, 0, 0, 1))
-
-    nx, ny = normals[:, 0:1], normals[:, 1:2]
-
-    residual = torch.abs(nx * dzdx + ny * dzdy)
-    return residual < thresh
-
-
-def get_planar_mask_depth_normal(depth_gt, norm_gt_norm,
-                                 normal_thresh=0.99,
-                                 geom_thresh=0.01):
-
-    mask_normal = normal_consistency_mask(norm_gt_norm, normal_thresh)
-    mask_normal
-    mask_geom = depth_normal_consistency(depth_gt, norm_gt_norm, geom_thresh)
-
-    planar_mask = mask_normal.unsqueeze(1) & mask_geom
-    return planar_mask
-
-
-def plane_residual_mask(depth, normal, inv_K, thresh=0.02):
-    """
-    depth:  [B,1, H, W]
-    normal: [B,3, H, W]
-    inv_K:  [B,4, 4]
-    """
-    B, _, H, W = depth.shape
-
-    y, x = torch.meshgrid(
-        torch.arange(H), torch.arange(W), indexing='ij'
-    )
-    ones = torch.ones_like(x)
-
-    pix = torch.stack([x, y, ones], dim=0).float().to(depth.device)
-    pix = pix.view(3, -1).unsqueeze(0).repeat(B, 1, 1)   # [B, 3, H*W]
-    cam = torch.bmm(inv_K[:, :3, :3], pix)  # 批量矩阵乘法（避免循环）
-
-    # 步骤4：批量3D点计算（相机坐标 * 深度）
-    depth_flat = depth.view(B, 1, -1)       # [B, 1, H*W]
-    pts = cam * depth_flat
-    pts = pts.view(B, 3, H, W)              # 恢复空间维度 [B, 3, H, W]
-
-    # 平面 residual
-    residual = torch.abs((normal * pts).sum(dim=1, keepdim=True))
-
-    return residual < thresh
-
-import torch
-import torch.nn.functional as F
-
-def get_planar_mask_by_consistency(depth, normal, inv_K, window_size=3, dist_thresh=0.05):
-    """
-    基于“点到平面距离一致性”计算平面 Mask
-    实现了你的思路：如果周围点到中心点确定的平面的距离很小，则是平面。
-
-    Args:
-        depth: [B, 1, H, W] 深度图 GT
-        normal: [B, 3, H, W] 法线图 GT (必须是归一化后的)
-        inv_K: [B, 3, 3] 逆内参
-        window_size: 邻域大小，推荐 3 或 5
-        dist_thresh: 距离阈值 (单位：米)。比如 0.05 表示允许 5cm 的起伏
-    """
-    B, C, H, W = depth.shape
-    device = depth.device
-
-    # ----------------------------------------
-    # 1. 深度图反投影为 3D 点云图 [B, 3, H, W]
-    # ----------------------------------------
-    y, x = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
-    # [3, H, W]
-    coords = torch.stack([x, y, torch.ones_like(x)], dim=0).float()
-    coords = coords.unsqueeze(0).repeat(B, 1, 1, 1)  # [B, 3, H, W]
-    
-    # 像素坐标 -> 相机归一化坐标: P_norm = K^-1 * uv
-    # 调整维度进行矩阵乘法
-    coords_flat = coords.view(B, 3, -1)  # [B, 3, N]
-    cam_coords = torch.bmm(inv_K[:,:3,:3], coords_flat).view(B, 3, H, W)
-    
-    # 恢复真实尺度: P = depth * P_norm
-    points_3d = cam_coords * depth
-
-    # ----------------------------------------
-    # 2. 利用 Unfold 提取局部邻域 (3x3 窗口)
-    # ----------------------------------------
-    pad = window_size // 2
-    # 提取邻域点: [B, 3*K*K, H, W]
-    points_patches = F.unfold(points_3d, kernel_size=window_size, padding=pad)
-    # 变形为 [B, 3, K*K, H, W] -> [B, 3, K*K, N_pixels]
-    points_patches = points_patches.view(B, 3, window_size**2, H, W)
-
-    # ----------------------------------------
-    # 3. 计算“点到平面”距离
-    # ----------------------------------------
-    # 中心点索引
-    center_idx = window_size**2 // 2
-    
-    # 取出中心点 P_0 和 中心法线 N_0
-    # P_0: [B, 3, 1, H, W]
-    p_center = points_patches[:, :, center_idx:center_idx+1, :, :]
-    # N_0: [B, 3, 1, H, W] (直接用输入的 Normal 作为中心法线)
-    n_center = normal.unsqueeze(2) 
-
-    # 计算邻域内所有点 P_i 到中心平面 (P_0, N_0) 的距离
-    # 公式: dist = | N_0 · (P_i - P_0) |
-    # 向量差: P_i - P_0
-    diff = points_patches - p_center # [B, 3, K*K, H, W]
-    
-    # 点积: sum(N_0 * diff)
-    # n_center 广播到 [B, 3, K*K, H, W]
-    dist_to_plane = torch.sum(n_center * diff, dim=1).abs() # [B, K*K, H, W]
-
-    # ----------------------------------------
-    # 4. 聚合误差并生成 Mask
-    # ----------------------------------------
-    # 计算邻域内的平均距离误差 (Mean Fitting Error)
-    # 也可以用 max() 来更严格地通过
-    mean_error = dist_to_plane.mean(dim=1, keepdim=True) # [B, 1, H, W]
-    
-    # 如果邻域内的点距离切平面的平均误差小于阈值，则是平面
-    planar_mask = mean_error < dist_thresh
-
-    return planar_mask
-
-# --- 使用示例 ---
-# mask = get_planar_mask_by_consistency(depth_gt, normal_gt, inv_K, window_size=3, dist_thresh=0.03)
-
-
-import matplotlib.pyplot as plt
-import numpy as np
-import os
-import torch
-
-def visualize_for_presentation(save_path, image, depth_gt, normal_gt, planar_mask):
-    """
-    可视化四合一图：原图、深度、法线、平面Mask
-    image: [B, 3, H, W] (归一化过的 tensor)
-    depth_gt: [B, 1, H, W]
-    normal_gt: [B, 3, H, W]
-    planar_mask: [B, 1, H, W] (bool or float)
-    """
-    # 取 batch 中的第一张图
-    idx = 0
-    # --- 1. 数据预处理 (Tensor -> Numpy) ---
-    # 原图反归一化 (假设是用 ImageNet mean/std 归一化的)
-    # 如果你的预处理不同，请修改这里的 mean/std
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(image.device)
-    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(image.device)
-    img_vis = (image[idx] * std + mean).clamp(0, 1).permute(1, 2, 0).cpu().detach().numpy()
-
-    # 深度图
-    depth_vis = depth_gt[idx, 0].cpu().detach().numpy()
-    
-    # 法线图 (从 [-1, 1] 映射到 [0, 1] 以便显示)
-    normal_vis = normal_gt[idx].permute(1, 2, 0).cpu().detach().numpy()
-    normal_vis = (normal_vis + 1) / 2.0
-    normal_vis = np.clip(normal_vis, 0, 1)
-
-    # Mask (转为 float)
-    mask_vis = planar_mask[idx, 0].cpu().detach().numpy().astype(np.float32)
-
-    # --- 2. 绘图 (Matplotlib) ---
-    plt.figure(figsize=(12, 10), tight_layout=True)
-    # 子图 1: RGB 原图
-    plt.subplot(2, 2, 1)
-    plt.imshow(img_vis)
-    plt.title("RGB Image", fontsize=14)
-    plt.axis('off')
-
-    # 子图 2: Depth GT (使用 inferno 或 magma 色阶)
-    plt.subplot(2, 2, 2)
-    plt.imshow(depth_vis, cmap='inferno')
-    plt.title("Depth GT", fontsize=14)
-    plt.colorbar(fraction=0.046, pad=0.04)
-    plt.axis('off')
-
-    # 子图 3: Normal GT
-    plt.subplot(2, 2, 3)
-    plt.imshow(normal_vis)
-    plt.title("Surface Normal GT", fontsize=14)
-    plt.axis('off')
-
-    # 子图 4: Planar Mask (叠加显示)
-    plt.subplot(2, 2, 4)
-    # 先画灰度原图作为背景
-    plt.imshow(np.mean(img_vis, axis=2), cmap='gray', alpha=0.6)
-    # 再叠加红色的 Mask (Mask=1的地方显示红色)
-    # 构造一个 RGBA 的 Mask 图
-    heatmap = np.zeros((mask_vis.shape[0], mask_vis.shape[1], 4))
-    heatmap[:, :, 0] = 1.0  # R
-    heatmap[:, :, 1] = 0.0  # G
-    heatmap[:, :, 2] = 0.0  # B
-    heatmap[:, :, 3] = mask_vis * 0.5 # Alpha (透明度), 0的地方全透，1的地方半透
-    plt.imshow(heatmap)
-    plt.title("Planar Mask (Red Area)", fontsize=14)
-    plt.axis('off')
-
-    # --- 3. 保存 ---
-    plt.tight_layout()
-    # 确保目录存在
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    plt.savefig(save_path, dpi=100, bbox_inches='tight') # dpi高一点更清晰
-    plt.close()
-    # print(f"Saved visualization to {save_path}")
-
-# --- 调用示例 ---
-# 在训练循环中调用：
-# planar_mask = get_robust_planar_mask(depth_gt, normal_gt)
-# visualize_for_presentation(f"vis_results/epoch_{epoch}_sample.png", image, depth_gt, normal_gt, planar_mask)
 def save_w_geo_heatmap(w_geo, save_dir, step, img_idx_offset=0, cmap='jet'):
     """
     专门保存w_geo的热力图（直观展示权重分布，红=高权重，蓝=低权重）
@@ -427,73 +198,9 @@ def save_w_geo_heatmap(w_geo, save_dir, step, img_idx_offset=0, cmap='jet'):
         vmax=1.0,             # 最大值（对应红）
         dpi=150               # 分辨率（越高越清晰）
     )
+    # print(f"已保存{batch_size}张w_geo热力图到：{save_dir}")
 
-
-def visualize_debug(save_dir, step, depth_gt, planar_mask, d_bins, inv_K, normal_gt):
-    """
-    保存调试图片：检查平面 Mask 和 Bin 分支的几何一致性
-    """
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-
-    # 1. 准备数据 (取 Batch 中的第 0 张图)
-    depth_gt_np = depth_gt[0, 0].cpu().detach().numpy()
-    planar_mask_np = planar_mask[0, 0].cpu().detach().numpy()
-
-    # 计算 Bin 分支生成的法线
-    with torch.no_grad():
-        # 确保 d_bins 是原图尺寸
-        if d_bins.shape[-2:] != depth_gt.shape[-2:]:
-            d_bins_up = F.interpolate(
-                d_bins, size=depth_gt.shape[-2:], mode='bilinear', align_corners=True)
-        else:
-            d_bins_up = d_bins
-
-        pred_normal_bins = depth_to_normal(d_bins_up, inv_K[:, :3, :3])
-
-    normal_bins_np = pred_normal_bins[0].permute(
-        1, 2, 0).cpu().detach().numpy()
-    normal_gt_np = normal_gt[0].permute(1, 2, 0).cpu().detach().numpy()
-
-    # 归一化法线到 [0, 1] 用于显示: (N + 1) / 2
-    normal_bins_vis = (normal_bins_np + 1) / 2.0
-    normal_gt_vis = (normal_gt_np + 1) / 2.0
-
-    # 2. 绘图
-    plt.figure(figsize=(15, 10))
-
-    # 子图 1: GT Depth
-    plt.subplot(2, 2, 1)
-    plt.imshow(depth_gt_np, cmap='inferno')
-    plt.title(f"GT Depth (Step {step})")
-    plt.axis('off')
-
-    # 子图 2: Planar Mask Heatmap
-    # 将 Mask 覆盖在 Depth 上看是否合理
-    plt.subplot(2, 2, 2)
-    plt.imshow(depth_gt_np, cmap='gray')
-    plt.imshow(planar_mask_np, cmap='jet', alpha=0.5)  # 红色表示平面区域
-    plt.title("Planar Mask (Red=Plane)")
-    plt.axis('off')
-
-    # 子图 3: Bin Branch Normal
-    plt.subplot(2, 2, 3)
-    plt.imshow(normal_bins_vis)
-    plt.title("Normal from Bins (DTN)")
-    plt.axis('off')
-
-    # 子图 4: GT Normal
-    plt.subplot(2, 2, 4)
-    plt.imshow(normal_gt_vis)
-    plt.title("GT Normal")
-    plt.axis('off')
-
-    # 保存
-    save_path = os.path.join(save_dir, f"debug_step_{step}.png")
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close()
-    # print(f"[Debug] Saved visualization to {save_path}")
+# 辅助类：梯度损失
 
 
 class GradientLoss(nn.Module):
@@ -535,6 +242,11 @@ if args.dataset == 'kitti' or args.dataset == 'nyu':
 
 def online_eval(model, dataloader_eval, gpu, ngpus, group, epoch, post_process=False):
 
+    # 创建保存可视化结果的文件夹 (建议)
+    # vis_dir = f"./vis_results/epoch_{epoch}"
+    # if not os.path.exists(vis_dir):
+    #     os.makedirs(vis_dir)
+
     eval_measures = torch.zeros(10).cuda(device=gpu)
     for _, eval_sample_batched in enumerate(tqdm(dataloader_eval.data)):
         with torch.no_grad():
@@ -548,14 +260,13 @@ def online_eval(model, dataloader_eval, gpu, ngpus, group, epoch, post_process=F
             inv_K = torch.autograd.Variable(
                 eval_sample_batched['inv_K'].cuda(gpu, non_blocking=True))
             d_final, _, _, _, _, _, _, _, _ = model(image, inv_K, epoch)
+            # d_final, d_geo, d_bins, pred_normal, pred_dist, alpha_map, u_geo, u_bins, offset_up
+            # d_final,depth_geo,depth_reg,pred_normal,pred_distance,w_geo=model(image, inv_K, epoch)
             pred_depth = d_final
-            if post_process:
-                image_flipped = flip_lr(image)
-                d_final_flipped, _, _, _, _, _, _, _, _ = model(
-                    image_flipped, inv_K, epoch)
-                pred_depth_flipped = d_final_flipped
-
-                pred_depth = post_process_depth(pred_depth, pred_depth_flipped)
+            # if post_process:
+            #     image_flipped = flip_lr(image)
+            #     depth1_flipped, u1_flipped, depth2_flipped, u2_flipped, n1_norm_flipped, distance_flipped,final_depth_flipped,_,_,_= model(image_flipped, inv_K, epoch)
+            #     pred_depth = post_process_depth(final_depth, depth1_flipped)
             pred_depth = pred_depth.cpu().numpy().squeeze()
             gt_depth = gt_depth.cpu().numpy().squeeze()
 
@@ -621,10 +332,11 @@ def online_eval(model, dataloader_eval, gpu, ngpus, group, epoch, post_process=F
 
 
 scaler = torch.amp.GradScaler("cuda")
+
+
 # -----------------------------------------------------------------------------
 # 辅助函数：从深度图计算法线 (用于 DTN Loss - 双向几何一致性)
 # -----------------------------------------------------------------------------
-
 
 def depth_to_normal(depth, inv_K):
     """
@@ -663,6 +375,21 @@ def depth_to_normal(depth, inv_K):
     normal = F.normalize(normal, dim=1, p=2)  # [B, 3, H, W]
 
     return normal
+
+# -----------------------------------------------------------------------------
+# 辅助函数：计算平面掩码 (用于 Distance Loss)
+# -----------------------------------------------------------------------------
+
+
+def get_planar_mask(depth_gt):
+    # 计算深度梯度，梯度小的地方认为是平面
+    # 使用简单的 Sobel 算子
+    # 也可以利用 GT Normal 的梯度，这里用 Depth 梯度简化
+    dy, dx = torch.gradient(depth_gt, dim=(2, 3))
+    grad_mag = torch.sqrt(dy**2 + dx**2)
+    # 阈值需根据数据尺度调整，NYU一般0.5-1.0有效
+    planar_mask = grad_mag < 0.5
+    return planar_mask
 
 # -----------------------------------------------------------------------------
 # 基础 Loss 类
@@ -756,13 +483,13 @@ class GeoPromptLoss(nn.Module):
         abs_diff = torch.abs(pred - gt)
         # 加上 mask
         abs_diff = abs_diff[mask]
-        s = uncertainty[mask]
-        # + 1e-6
-        loss = abs_diff / s + 0.5 * torch.log(s)
+        uncertainty = uncertainty[mask]
 
-        # eps = 1e-6
-        # log_sigma = torch.log(uncertainty + eps)
-        # loss = abs_diff * torch.exp(-log_sigma) + log_sigma    # [N,]
+        # 加上 eps 防止除以0
+        # loss = abs_diff / (uncertainty + 1e-6) + torch.log(uncertainty + 1e-6)
+        # 修改
+        loss = abs_diff * torch.exp(-uncertainty) + \
+            uncertainty      # s = log_sigma
 
         return loss.mean()
 
@@ -789,6 +516,7 @@ class GeoPromptLoss(nn.Module):
         # --- 1. 深度分支监督 (Deep Supervision) ---
         # A. 最终融合深度 (Main Loss)
         loss_final = self.silog_loss(d_final, depth_gt, mask)
+
         # B. 几何深度 (带不确定性)
         # 几何分支容易在边缘出错，所以用 Uncertainty Loss 允许它在边缘“不自信”
         loss_geo = self.uncertainty_loss(d_geo, depth_gt, u_geo, mask)
@@ -831,9 +559,7 @@ class GeoPromptLoss(nn.Module):
             dist_gt = torch.sum(normal_gt * points_gt, dim=1,
                                 keepdim=True).abs()  # [B, 1, H, W]
 
-        # planar_mask = get_planar_mask(depth_gt)
-        # planar_mask = get_planar_mask_depth_normal(depth_gt, normal_gt)
-        planar_mask =get_planar_mask_by_consistency(depth_gt, normal_gt,inv_K)
+        planar_mask = get_planar_mask(depth_gt)
         valid_dist_mask = mask & planar_mask
 
         if valid_dist_mask.sum() > 0:
@@ -844,7 +570,7 @@ class GeoPromptLoss(nn.Module):
 
         # --- 3. 几何一致性监督 (DTN Loss - 创新点！) ---
         # 强制 Prompt Bin 分支预测出的深度图，在转换为法线后，也必须准确
-        # DTN Loss (Bin 深度 -> 法线 -> 对比 GT 法线)
+        # 这就是“王智彬论文”中的核心约束
         pred_normal_from_bins = depth_to_normal(d_bins, inv_K[..., :3, :3])
         # 1：可视化
 
@@ -864,17 +590,17 @@ class GeoPromptLoss(nn.Module):
 
         if epoch < 5:
             # 只用 loss_final + 轻量 normal_loss
-            total_loss = 1.0 * loss_final + 0.1 * loss_normal+0.0 * loss_offset
+            total_loss = 1.5 * loss_final + 0.05 * loss_normal
         else:
             # 再加 geo / bins / dist / dtn 等
             total_loss = 1.0 * loss_final + \
                 0.5 * loss_geo + \
                 0.5 * loss_bins + \
-                0.5 * loss_dist + \
-                0.2 * loss_dtn + \
+                0.2 * loss_dist + \
+                0.5 * loss_dtn + \
                 0.1 * loss_offset + \
                 0.05 * loss_grad + \
-                5 * loss_normal
+                0.05 * loss_normal
 
         # --- 5. 总 Loss 加权 ---
         # 权重建议 (根据 NDDepth 和其他论文经验)
@@ -933,6 +659,10 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         model = torch.nn.DataParallel(model)
         model.cuda()
+    # if int(torch.__version__.split('.')[0]) >= 2:
+    #     print("== Using torch.compile for acceleration")
+    #     model = torch.compile(model)
+
     if args.distributed:
         print("== Model Initialized on GPU: {}".format(args.gpu))
     else:
@@ -1032,7 +762,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
     if args.multiprocessing_distributed:
         group = dist.new_group([i for i in range(ngpus_per_node)])
-    save_dir = "result/bin"
+    save_dir = "result/w_geo_norm"
     os.makedirs(save_dir, exist_ok=True)
 
     criterion = GeoPromptLoss(min_depth=0, max_depth=args.max_depth).cuda()
@@ -1044,6 +774,8 @@ def main_worker(gpu, ngpus_per_node, args):
             optimizer.zero_grad()
 
             loss = 0
+            # loss_depth1 = 0
+            # loss_depth2 = 0
 
             before_op_time = time.time()
 
@@ -1067,10 +799,6 @@ def main_worker(gpu, ngpus_per_node, args):
                 else:
                     mask = depth_gt > 1.0
 
-                normal_gt = torch.stack(
-                    [normal_gt[:, 0], normal_gt[:, 2], normal_gt[:, 1]], 1)
-                normal_gt_norm = F.normalize(normal_gt, dim=1, p=2)
-                # distance_gt = dn_to_distance(depth_gt, normal_gt_norm, inv_K_p)
                 # 3. 准备 Outputs 字典
                 outputs = {
                     'd_final': d_final,
@@ -1084,11 +812,12 @@ def main_worker(gpu, ngpus_per_node, args):
                 }
                 targets = {
                     'depth': depth_gt,
-                    'normal': normal_gt_norm,
+                    'normal': normal_gt,
                     'inv_K': inv_K,
                     'mask': mask
                 }
                 # 5. 计算 Loss
+                # if epoch < 5:
 
                 loss, loss_dict_val = criterion(outputs, targets, epoch)
 
@@ -1153,8 +882,7 @@ def main_worker(gpu, ngpus_per_node, args):
                     writer.add_scalar('normal_loss', normal_loss, global_step)
                     writer.add_scalar('dist_loss', dist_loss, global_step)
 
-                    writer.add_scalar('dtn_loss_bin_normalGT',
-                                      dtn_loss, global_step)
+                    writer.add_scalar('dtn_loss', dtn_loss, global_step)
                     writer.add_scalar('offset_loss', offset_loss, global_step)
 
                     writer.flush()
@@ -1163,16 +891,10 @@ def main_worker(gpu, ngpus_per_node, args):
                 time.sleep(0.1)
                 model.eval()
                 with torch.no_grad():
+                    # eval_measures = online_eval(model, dataloader_eval, gpu, ngpus_per_node, group, epoch, post_process=True)
                     eval_measures = online_eval(
-                        model, dataloader_eval, gpu, ngpus_per_node, group, epoch, post_process=True)
-                    planar_mask = get_planar_mask_depth_normal(depth_gt, normal_gt_norm)
-                    
-                    planar_mask=get_planar_mask_by_consistency(depth_gt, normal_gt, inv_K, window_size=7, dist_thresh=0.05)
-                    visualize_debug(save_dir, global_step, depth_gt,
-                                    planar_mask, d_bins, inv_K, normal_gt_norm)
-                    # 展示V2
-                    planar_mask=get_planar_mask_by_consistency(depth_gt, normal_gt_norm, inv_K, window_size=7, dist_thresh=0.03)
-                    visualize_for_presentation(f"result/bin/mask_th001/step_{global_step}_sample.png", image, depth_gt, normal_gt_norm, planar_mask)
+                        model, dataloader_eval, gpu, ngpus_per_node, group, epoch, post_process=False)
+                    # save_w_geo_heatmap(w_geo,save_dir,global_step)
                 if eval_measures is not None:
                     exp_name = '%s' % (datetime.now().strftime('%m%d'))
                     log_txt = os.path.join(

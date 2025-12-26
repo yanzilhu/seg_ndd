@@ -167,7 +167,7 @@ def get_planar_mask(depth_gt):
     return planar_mask
 
 
-def normal_consistency_mask(normals, thresh=0.99):
+def normal_consistency_mask(normals, thresh=0.95):
     """
     normals: [B, 3, H, W] normalized
     """
@@ -182,8 +182,7 @@ def normal_consistency_mask(normals, thresh=0.99):
     normal_mask = (nx > thresh) & (ny > thresh)
     return normal_mask
 
-
-def depth_normal_consistency(depth, normals, thresh=0.01):
+def depth_normal_consistency(depth, normals, thresh=0.05):
     dzdx = depth[:, :, :, 1:] - depth[:, :, :, :-1]
     dzdy = depth[:, :, 1:, :] - depth[:, :, :-1, :]
 
@@ -195,207 +194,83 @@ def depth_normal_consistency(depth, normals, thresh=0.01):
     residual = torch.abs(nx * dzdx + ny * dzdy)
     return residual < thresh
 
-
 def get_planar_mask_depth_normal(depth_gt, norm_gt_norm,
-                                 normal_thresh=0.99,
-                                 geom_thresh=0.01):
+                                 normal_thresh=0.95,
+                                 geom_thresh=0.05):
 
     mask_normal = normal_consistency_mask(norm_gt_norm, normal_thresh)
-    mask_normal
-    mask_geom = depth_normal_consistency(depth_gt, norm_gt_norm, geom_thresh)
+    mask_geom   = depth_normal_consistency(depth_gt, norm_gt_norm, geom_thresh)
 
-    planar_mask = mask_normal.unsqueeze(1) & mask_geom
+    planar_mask = mask_normal & mask_geom
     return planar_mask
-
-
-def plane_residual_mask(depth, normal, inv_K, thresh=0.02):
-    """
-    depth:  [B,1, H, W]
-    normal: [B,3, H, W]
-    inv_K:  [B,4, 4]
-    """
-    B, _, H, W = depth.shape
-
-    y, x = torch.meshgrid(
-        torch.arange(H), torch.arange(W), indexing='ij'
-    )
-    ones = torch.ones_like(x)
-
-    pix = torch.stack([x, y, ones], dim=0).float().to(depth.device)
-    pix = pix.view(3, -1).unsqueeze(0).repeat(B, 1, 1)   # [B, 3, H*W]
-    cam = torch.bmm(inv_K[:, :3, :3], pix)  # 批量矩阵乘法（避免循环）
-
-    # 步骤4：批量3D点计算（相机坐标 * 深度）
-    depth_flat = depth.view(B, 1, -1)       # [B, 1, H*W]
-    pts = cam * depth_flat
-    pts = pts.view(B, 3, H, W)              # 恢复空间维度 [B, 3, H, W]
-
-    # 平面 residual
-    residual = torch.abs((normal * pts).sum(dim=1, keepdim=True))
-
-    return residual < thresh
-
-import torch
-import torch.nn.functional as F
-
-def get_planar_mask_by_consistency(depth, normal, inv_K, window_size=3, dist_thresh=0.05):
-    """
-    基于“点到平面距离一致性”计算平面 Mask
-    实现了你的思路：如果周围点到中心点确定的平面的距离很小，则是平面。
-
-    Args:
-        depth: [B, 1, H, W] 深度图 GT
-        normal: [B, 3, H, W] 法线图 GT (必须是归一化后的)
-        inv_K: [B, 3, 3] 逆内参
-        window_size: 邻域大小，推荐 3 或 5
-        dist_thresh: 距离阈值 (单位：米)。比如 0.05 表示允许 5cm 的起伏
-    """
-    B, C, H, W = depth.shape
-    device = depth.device
-
-    # ----------------------------------------
-    # 1. 深度图反投影为 3D 点云图 [B, 3, H, W]
-    # ----------------------------------------
-    y, x = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
-    # [3, H, W]
-    coords = torch.stack([x, y, torch.ones_like(x)], dim=0).float()
-    coords = coords.unsqueeze(0).repeat(B, 1, 1, 1)  # [B, 3, H, W]
-    
-    # 像素坐标 -> 相机归一化坐标: P_norm = K^-1 * uv
-    # 调整维度进行矩阵乘法
-    coords_flat = coords.view(B, 3, -1)  # [B, 3, N]
-    cam_coords = torch.bmm(inv_K[:,:3,:3], coords_flat).view(B, 3, H, W)
-    
-    # 恢复真实尺度: P = depth * P_norm
-    points_3d = cam_coords * depth
-
-    # ----------------------------------------
-    # 2. 利用 Unfold 提取局部邻域 (3x3 窗口)
-    # ----------------------------------------
-    pad = window_size // 2
-    # 提取邻域点: [B, 3*K*K, H, W]
-    points_patches = F.unfold(points_3d, kernel_size=window_size, padding=pad)
-    # 变形为 [B, 3, K*K, H, W] -> [B, 3, K*K, N_pixels]
-    points_patches = points_patches.view(B, 3, window_size**2, H, W)
-
-    # ----------------------------------------
-    # 3. 计算“点到平面”距离
-    # ----------------------------------------
-    # 中心点索引
-    center_idx = window_size**2 // 2
-    
-    # 取出中心点 P_0 和 中心法线 N_0
-    # P_0: [B, 3, 1, H, W]
-    p_center = points_patches[:, :, center_idx:center_idx+1, :, :]
-    # N_0: [B, 3, 1, H, W] (直接用输入的 Normal 作为中心法线)
-    n_center = normal.unsqueeze(2) 
-
-    # 计算邻域内所有点 P_i 到中心平面 (P_0, N_0) 的距离
-    # 公式: dist = | N_0 · (P_i - P_0) |
-    # 向量差: P_i - P_0
-    diff = points_patches - p_center # [B, 3, K*K, H, W]
-    
-    # 点积: sum(N_0 * diff)
-    # n_center 广播到 [B, 3, K*K, H, W]
-    dist_to_plane = torch.sum(n_center * diff, dim=1).abs() # [B, K*K, H, W]
-
-    # ----------------------------------------
-    # 4. 聚合误差并生成 Mask
-    # ----------------------------------------
-    # 计算邻域内的平均距离误差 (Mean Fitting Error)
-    # 也可以用 max() 来更严格地通过
-    mean_error = dist_to_plane.mean(dim=1, keepdim=True) # [B, 1, H, W]
-    
-    # 如果邻域内的点距离切平面的平均误差小于阈值，则是平面
-    planar_mask = mean_error < dist_thresh
-
-    return planar_mask
-
-# --- 使用示例 ---
-# mask = get_planar_mask_by_consistency(depth_gt, normal_gt, inv_K, window_size=3, dist_thresh=0.03)
 
 
 import matplotlib.pyplot as plt
-import numpy as np
-import os
-import torch
 
-def visualize_for_presentation(save_path, image, depth_gt, normal_gt, planar_mask):
+def visualize_planar_mask(image, planar_mask):
     """
-    可视化四合一图：原图、深度、法线、平面Mask
-    image: [B, 3, H, W] (归一化过的 tensor)
-    depth_gt: [B, 1, H, W]
-    normal_gt: [B, 3, H, W]
-    planar_mask: [B, 1, H, W] (bool or float)
+    image: [3, H, W], 0~1
+    planar_mask: [H, W]
     """
-    # 取 batch 中的第一张图
-    idx = 0
-    # --- 1. 数据预处理 (Tensor -> Numpy) ---
-    # 原图反归一化 (假设是用 ImageNet mean/std 归一化的)
-    # 如果你的预处理不同，请修改这里的 mean/std
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(image.device)
-    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(image.device)
-    img_vis = (image[idx] * std + mean).clamp(0, 1).permute(1, 2, 0).cpu().detach().numpy()
+    img = image.permute(1, 2, 0).cpu().numpy()
+    mask = planar_mask.cpu().numpy()
 
-    # 深度图
-    depth_vis = depth_gt[idx, 0].cpu().detach().numpy()
+    overlay = img.copy()
+    overlay[mask] = overlay[mask] * 0.3 + [1, 0, 0] * 0.7  # 红色平面
+
+    plt.figure(figsize=(6,4))
+    plt.imshow(overlay)
+    plt.axis('off')
+    plt.title("Planar Regions (GT depth + normal)")
+    plt.show()
+# 核心可视化+保存函数
+def visualize_and_save_planar_mask(image, planar_mask, save_dir, batch_idx=0, figsize=(8, 6)):
+    """
+    可视化并保存平面掩码（红色叠加原图）
+    Args:
+        image: [B, 3, H, W]，像素值通常为0~1或0~255（自动归一化）
+        planar_mask: [B, H, W]，bool类型（平面区域为True）
+        save_dir: 保存目录（不存在则自动创建）
+        batch_idx: 选择Batch中第几个样本可视化（默认第0个）
+        figsize: 画布大小（宽, 高）
+    """
+    # 1. 创建保存目录
+    os.makedirs(save_dir, exist_ok=True)
     
-    # 法线图 (从 [-1, 1] 映射到 [0, 1] 以便显示)
-    normal_vis = normal_gt[idx].permute(1, 2, 0).cpu().detach().numpy()
-    normal_vis = (normal_vis + 1) / 2.0
-    normal_vis = np.clip(normal_vis, 0, 1)
-
-    # Mask (转为 float)
-    mask_vis = planar_mask[idx, 0].cpu().detach().numpy().astype(np.float32)
-
-    # --- 2. 绘图 (Matplotlib) ---
-    plt.figure(figsize=(12, 10), tight_layout=True)
-    # 子图 1: RGB 原图
-    plt.subplot(2, 2, 1)
-    plt.imshow(img_vis)
-    plt.title("RGB Image", fontsize=14)
-    plt.axis('off')
-
-    # 子图 2: Depth GT (使用 inferno 或 magma 色阶)
-    plt.subplot(2, 2, 2)
-    plt.imshow(depth_vis, cmap='inferno')
-    plt.title("Depth GT", fontsize=14)
-    plt.colorbar(fraction=0.046, pad=0.04)
-    plt.axis('off')
-
-    # 子图 3: Normal GT
-    plt.subplot(2, 2, 3)
-    plt.imshow(normal_vis)
-    plt.title("Surface Normal GT", fontsize=14)
-    plt.axis('off')
-
-    # 子图 4: Planar Mask (叠加显示)
-    plt.subplot(2, 2, 4)
-    # 先画灰度原图作为背景
-    plt.imshow(np.mean(img_vis, axis=2), cmap='gray', alpha=0.6)
-    # 再叠加红色的 Mask (Mask=1的地方显示红色)
-    # 构造一个 RGBA 的 Mask 图
-    heatmap = np.zeros((mask_vis.shape[0], mask_vis.shape[1], 4))
-    heatmap[:, :, 0] = 1.0  # R
-    heatmap[:, :, 1] = 0.0  # G
-    heatmap[:, :, 2] = 0.0  # B
-    heatmap[:, :, 3] = mask_vis * 0.5 # Alpha (透明度), 0的地方全透，1的地方半透
-    plt.imshow(heatmap)
-    plt.title("Planar Mask (Red Area)", fontsize=14)
-    plt.axis('off')
-
-    # --- 3. 保存 ---
-    plt.tight_layout()
-    # 确保目录存在
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    plt.savefig(save_path, dpi=100, bbox_inches='tight') # dpi高一点更清晰
-    plt.close()
-    # print(f"Saved visualization to {save_path}")
-
-# --- 调用示例 ---
-# 在训练循环中调用：
-# planar_mask = get_robust_planar_mask(depth_gt, normal_gt)
-# visualize_for_presentation(f"vis_results/epoch_{epoch}_sample.png", image, depth_gt, normal_gt, planar_mask)
+    # 2. 提取Batch中单个样本（避免Batch维度干扰）
+    img_single = image[batch_idx]  # [3, H, W]
+    mask_single = planar_mask[batch_idx]  # [H, W]
+    
+    # 3. 张量预处理（CUDA→CPU、转NumPy、调整维度）
+    # 图像：[3, H, W] → [H, W, 3]，并归一化到0~1
+    img_np = img_single.detach().cpu().numpy()
+    img_np = img_np.transpose(1, 2, 0)  # C,H,W → H,W,C
+    if img_np.max() > 1.0:  # 若像素值是0~255，归一化到0~1
+        img_np = img_np / 255.0
+    
+    # 掩码：CUDA→CPU→NumPy
+    mask_np = mask_single.detach().cpu().numpy()
+    
+    # 4. 红色叠加平面区域（核心可视化逻辑）
+    overlay = img_np.copy()
+    # 平面区域：原图×0.3 + 红色×0.7（保留原图纹理，突出红色）
+    overlay[mask_np] = overlay[mask_np] * 0.3 + np.array([1, 0, 0]) * 0.7
+    overlay = np.clip(overlay, 0, 1)  # 防止数值溢出
+    
+    # 5. 绘图并保存
+    plt.figure(figsize=figsize)
+    plt.imshow(overlay)
+    plt.axis('off')  # 关闭坐标轴
+    plt.title(f"Planar Mask (Normal+Depth Consistency)", fontsize=12)
+    plt.tight_layout()  # 自动调整布局，避免标题/边缘裁剪
+    
+    # 6. 保存图片（命名示例：planar_mask_0.png）
+    save_path = os.path.join(save_dir, f"planar_mask_{batch_idx}.png")
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')  # dpi提高清晰度，bbox_inches去除白边
+    plt.close()  # 关闭画布释放内存
+    
+    print(f"✅ 平面掩码已保存至：{save_path}")
+    
 def save_w_geo_heatmap(w_geo, save_dir, step, img_idx_offset=0, cmap='jet'):
     """
     专门保存w_geo的热力图（直观展示权重分布，红=高权重，蓝=低权重）
@@ -427,6 +302,8 @@ def save_w_geo_heatmap(w_geo, save_dir, step, img_idx_offset=0, cmap='jet'):
         vmax=1.0,             # 最大值（对应红）
         dpi=150               # 分辨率（越高越清晰）
     )
+
+    # print(f"已保存{batch_size}张w_geo热力图到：{save_dir}")
 
 
 def visualize_debug(save_dir, step, depth_gt, planar_mask, d_bins, inv_K, normal_gt):
@@ -493,7 +370,7 @@ def visualize_debug(save_dir, step, depth_gt, planar_mask, d_bins, inv_K, normal
     plt.tight_layout()
     plt.savefig(save_path)
     plt.close()
-    # print(f"[Debug] Saved visualization to {save_path}")
+    print(f"[Debug] Saved visualization to {save_path}")
 
 
 class GradientLoss(nn.Module):
@@ -664,6 +541,7 @@ def depth_to_normal(depth, inv_K):
 
     return normal
 
+
 # -----------------------------------------------------------------------------
 # 基础 Loss 类
 # -----------------------------------------------------------------------------
@@ -756,8 +634,8 @@ class GeoPromptLoss(nn.Module):
         abs_diff = torch.abs(pred - gt)
         # 加上 mask
         abs_diff = abs_diff[mask]
-        s = uncertainty[mask]
-        # + 1e-6
+        uncertainty = uncertainty[mask]
+        s = uncertainty[mask] + 1e-6
         loss = abs_diff / s + 0.5 * torch.log(s)
 
         # eps = 1e-6
@@ -832,8 +710,7 @@ class GeoPromptLoss(nn.Module):
                                 keepdim=True).abs()  # [B, 1, H, W]
 
         # planar_mask = get_planar_mask(depth_gt)
-        # planar_mask = get_planar_mask_depth_normal(depth_gt, normal_gt)
-        planar_mask =get_planar_mask_by_consistency(depth_gt, normal_gt,inv_K)
+        planar_mask=get_planar_mask_depth_normal(depth_gt,normal_gt)
         valid_dist_mask = mask & planar_mask
 
         if valid_dist_mask.sum() > 0:
@@ -874,7 +751,7 @@ class GeoPromptLoss(nn.Module):
                 0.2 * loss_dtn + \
                 0.1 * loss_offset + \
                 0.05 * loss_grad + \
-                5 * loss_normal
+                0.1 * loss_normal
 
         # --- 5. 总 Loss 加权 ---
         # 权重建议 (根据 NDDepth 和其他论文经验)
@@ -933,6 +810,10 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         model = torch.nn.DataParallel(model)
         model.cuda()
+    # if int(torch.__version__.split('.')[0]) >= 2:
+    #     print("== Using torch.compile for acceleration")
+    #     model = torch.compile(model)
+
     if args.distributed:
         print("== Model Initialized on GPU: {}".format(args.gpu))
     else:
@@ -1044,6 +925,8 @@ def main_worker(gpu, ngpus_per_node, args):
             optimizer.zero_grad()
 
             loss = 0
+            # loss_depth1 = 0
+            # loss_depth2 = 0
 
             before_op_time = time.time()
 
@@ -1057,179 +940,181 @@ def main_worker(gpu, ngpus_per_node, args):
                 sample_batched['inv_K'].cuda(args.gpu, non_blocking=True))
             inv_K_p = torch.autograd.Variable(
                 sample_batched['inv_K_p'].cuda(args.gpu, non_blocking=True))
-
-            # 注意：forward 返回值顺序变了，要对应上
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                d_final, d_geo, d_bins, pred_normal, pred_dist, alpha_map, u_geo, u_bins, offset_up = model(
-                    image, inv_K, epoch)
-                if args.dataset == 'nyu':
-                    mask = depth_gt > 0.1
-                else:
-                    mask = depth_gt > 1.0
-
-                normal_gt = torch.stack(
+            
+            normal_gt = torch.stack(
                     [normal_gt[:, 0], normal_gt[:, 2], normal_gt[:, 1]], 1)
-                normal_gt_norm = F.normalize(normal_gt, dim=1, p=2)
-                # distance_gt = dn_to_distance(depth_gt, normal_gt_norm, inv_K_p)
-                # 3. 准备 Outputs 字典
-                outputs = {
-                    'd_final': d_final,
-                    'd_geo': d_geo,
-                    'd_bins': d_bins,
-                    'pred_normal': pred_normal,
-                    'pred_dist': pred_dist,
-                    'u_geo': u_geo,
-                    'u_bins': u_bins,
-                    'offset_up': offset_up
-                }
-                targets = {
-                    'depth': depth_gt,
-                    'normal': normal_gt_norm,
-                    'inv_K': inv_K,
-                    'mask': mask
-                }
-                # 5. 计算 Loss
+            normal_gt_norm = F.normalize(normal_gt, dim=1, p=2)
+            planar_mask=get_planar_mask_depth_normal(depth_gt,normal_gt_norm)
+            visualize_planar_mask(image,planar_mask)
 
-                loss, loss_dict_val = criterion(outputs, targets, epoch)
+            # # 注意：forward 返回值顺序变了，要对应上
+            # with torch.autocast(device_type="cuda", dtype=torch.float16):
+            #     d_final, d_geo, d_bins, pred_normal, pred_dist, alpha_map, u_geo, u_bins, offset_up = model(
+            #         image, inv_K, epoch)
+            #     if args.dataset == 'nyu':
+            #         mask = depth_gt > 0.1
+            #     else:
+            #         mask = depth_gt > 1.0
 
-                total_loss = loss_dict_val['total']
-                silog_loss_val = loss_dict_val['silog']
-                geo_loss = loss_dict_val['geo']
-                bins_loss = loss_dict_val['bins']
-                normal_loss = loss_dict_val['normal']
-                dist_loss = loss_dict_val['dist']
-                dtn_loss = loss_dict_val['dtn']
-                offset_loss = loss_dict_val['offset']
+            #     normal_gt = torch.stack(
+            #         [normal_gt[:, 0], normal_gt[:, 2], normal_gt[:, 1]], 1)
+            #     normal_gt_norm = F.normalize(normal_gt, dim=1, p=2)
+            #     # distance_gt = dn_to_distance(depth_gt, normal_gt_norm, inv_K_p)
+            #     # 3. 准备 Outputs 字典
+            #     outputs = {
+            #         'd_final': d_final,
+            #         'd_geo': d_geo,
+            #         'd_bins': d_bins,
+            #         'pred_normal': pred_normal,
+            #         'pred_dist': pred_dist,
+            #         'u_geo': u_geo,
+            #         'u_bins': u_bins,
+            #         'offset_up': offset_up
+            #     }
+            #     targets = {
+            #         'depth': depth_gt,
+            #         'normal': normal_gt_norm,
+            #         'inv_K': inv_K,
+            #         'mask': mask
+            #     }
+            #     # 5. 计算 Loss
 
-            # loss.backward()
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(
-                model.parameters(), max_norm=10, norm_type=2)
+            #     loss, loss_dict_val = criterion(outputs, targets, epoch)
 
-            for param_group in optimizer.param_groups:
-                current_lr = (args.learning_rate - end_learning_rate) * \
-                    (1 - global_step / num_total_steps) ** 0.9 + end_learning_rate
-                param_group['lr'] = current_lr
+            #     total_loss = loss_dict_val['total']
+            #     silog_loss_val = loss_dict_val['silog']
+            #     geo_loss = loss_dict_val['geo']
+            #     bins_loss = loss_dict_val['bins']
+            #     normal_loss = loss_dict_val['normal']
+            #     dist_loss = loss_dict_val['dist']
+            #     dtn_loss = loss_dict_val['dtn']
+            #     offset_loss = loss_dict_val['offset']
 
-            # optimizer.step()
-            scaler.step(optimizer)
-            scaler.update()
+            # # loss.backward()
+            # scaler.scale(loss).backward()
+            # scaler.unscale_(optimizer)
+            # nn.utils.clip_grad_norm_(
+            #     model.parameters(), max_norm=10, norm_type=2)
 
-            if not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
-                if global_step % 10 == 0:
-                    print('[epoch][s/s_per_e/gs]: [{}][{}/{}/{}], lr: {:.12f}, loss: {:.12f}'.format(
-                        epoch, step, steps_per_epoch, global_step, current_lr, loss))
-                if np.isnan(loss.cpu().item()):
-                    print('NaN in loss occurred. Aborting training.')
-                    return -1
+            # for param_group in optimizer.param_groups:
+            #     current_lr = (args.learning_rate - end_learning_rate) * \
+            #         (1 - global_step / num_total_steps) ** 0.9 + end_learning_rate
+            #     param_group['lr'] = current_lr
 
-            duration += time.time() - before_op_time
-            if global_step and global_step % args.log_freq == 0 and not model_just_loaded:
-                var_sum = [var.sum().item()
-                           for var in model.parameters() if var.requires_grad]
-                var_cnt = len(var_sum)
-                var_sum = np.sum(var_sum)
-                examples_per_sec = args.batch_size / duration * args.log_freq
-                duration = 0
-                time_sofar = (time.time() - start_time) / 3600
-                training_time_left = (
-                    num_total_steps / global_step - 1.0) * time_sofar
-                if not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
-                    print("{}".format(args.model_name))
-                print_string = 'GPU: {} | examples/s: {:4.2f} | loss: {:.5f} | var sum: {:.3f} avg: {:.3f} | time elapsed: {:.2f}h | time left: {:.2f}h'
-                print(print_string.format(args.gpu, examples_per_sec, loss, var_sum.item(
-                ), var_sum.item()/var_cnt, time_sofar, training_time_left))
+            # # optimizer.step()
+            # scaler.step(optimizer)
+            # scaler.update()
 
-                if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                                                            and args.rank % ngpus_per_node == 0):
-                    writer.add_scalar('loss', loss, global_step)
-                    writer.add_scalar(
-                        'total loss',  loss_dict_val['total'], global_step)
-                    writer.add_scalar(
-                        'silog', loss_dict_val['silog'], global_step)
-                    writer.add_scalar('geo_loss', geo_loss, global_step)
-                    writer.add_scalar('bins_loss', bins_loss, global_step)
-                    writer.add_scalar('normal_loss', normal_loss, global_step)
-                    writer.add_scalar('dist_loss', dist_loss, global_step)
+            # if not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
+            #     if global_step % 10 == 0:
+            #         print('[epoch][s/s_per_e/gs]: [{}][{}/{}/{}], lr: {:.12f}, loss: {:.12f}'.format(
+            #             epoch, step, steps_per_epoch, global_step, current_lr, loss))
+            #     if np.isnan(loss.cpu().item()):
+            #         print('NaN in loss occurred. Aborting training.')
+            #         return -1
 
-                    writer.add_scalar('dtn_loss_bin_normalGT',
-                                      dtn_loss, global_step)
-                    writer.add_scalar('offset_loss', offset_loss, global_step)
+            # duration += time.time() - before_op_time
+            # if global_step and global_step % args.log_freq == 0 and not model_just_loaded:
+            #     var_sum = [var.sum().item()
+            #                for var in model.parameters() if var.requires_grad]
+            #     var_cnt = len(var_sum)
+            #     var_sum = np.sum(var_sum)
+            #     examples_per_sec = args.batch_size / duration * args.log_freq
+            #     duration = 0
+            #     time_sofar = (time.time() - start_time) / 3600
+            #     training_time_left = (
+            #         num_total_steps / global_step - 1.0) * time_sofar
+            #     if not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
+            #         print("{}".format(args.model_name))
+            #     print_string = 'GPU: {} | examples/s: {:4.2f} | loss: {:.5f} | var sum: {:.3f} avg: {:.3f} | time elapsed: {:.2f}h | time left: {:.2f}h'
+            #     print(print_string.format(args.gpu, examples_per_sec, loss, var_sum.item(
+            #     ), var_sum.item()/var_cnt, time_sofar, training_time_left))
 
-                    writer.flush()
+            #     if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+            #                                                 and args.rank % ngpus_per_node == 0):
+            #         writer.add_scalar('loss', loss, global_step)
+            #         writer.add_scalar(
+            #             'total loss',  loss_dict_val['total'], global_step)
+            #         writer.add_scalar(
+            #             'silog', loss_dict_val['silog'], global_step)
+            #         writer.add_scalar('geo_loss', geo_loss, global_step)
+            #         writer.add_scalar('bins_loss', bins_loss, global_step)
+            #         writer.add_scalar('normal_loss', normal_loss, global_step)
+            #         writer.add_scalar('dist_loss', dist_loss, global_step)
 
-            if args.do_online_eval and global_step and global_step % args.eval_freq == 0 and not model_just_loaded:
-                time.sleep(0.1)
-                model.eval()
-                with torch.no_grad():
-                    eval_measures = online_eval(
-                        model, dataloader_eval, gpu, ngpus_per_node, group, epoch, post_process=True)
-                    planar_mask = get_planar_mask_depth_normal(depth_gt, normal_gt_norm)
-                    
-                    planar_mask=get_planar_mask_by_consistency(depth_gt, normal_gt, inv_K, window_size=7, dist_thresh=0.05)
-                    visualize_debug(save_dir, global_step, depth_gt,
-                                    planar_mask, d_bins, inv_K, normal_gt_norm)
-                    # 展示V2
-                    planar_mask=get_planar_mask_by_consistency(depth_gt, normal_gt_norm, inv_K, window_size=7, dist_thresh=0.03)
-                    visualize_for_presentation(f"result/bin/mask_th001/step_{global_step}_sample.png", image, depth_gt, normal_gt_norm, planar_mask)
-                if eval_measures is not None:
-                    exp_name = '%s' % (datetime.now().strftime('%m%d'))
-                    log_txt = os.path.join(
-                        args.log_directory + '/' + args.model_name, exp_name+'_logs.txt')
-                    with open(log_txt, 'a') as txtfile:
-                        txtfile.write(">>>>>>>>>>>>>>>>>>>>>>>>>Step:%d>>>>>>>>>>>>>>>>>>>>>>>>>\n" % (
-                            int(global_step)))
-                        txtfile.write("{:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}\n".format('silog',
-                                                                                                               'abs_rel', 'log10', 'rms', 'sq_rel', 'log_rms', 'd1', 'd2', 'd3'))
-                        txtfile.write("depth estimation\n")
-                        line = ''
-                        for i in range(9):
-                            line += '{:7.4f}, '.format(eval_measures[i])
-                        txtfile.write(line+'\n')
+            #         writer.add_scalar('dtn_loss_bin_normalGT',
+            #                           dtn_loss, global_step)
+            #         writer.add_scalar('offset_loss', offset_loss, global_step)
 
-                    for i in range(9):
-                        eval_summary_writer.add_scalar(
-                            eval_metrics[i], eval_measures[i].cpu(), int(global_step))
-                        measure = eval_measures[i]
-                        is_best = False
-                        if i < 6 and measure < best_eval_measures_lower_better[i]:
-                            old_best = best_eval_measures_lower_better[i].item(
-                            )
-                            best_eval_measures_lower_better[i] = measure.item()
-                            is_best = True
-                        elif i >= 6 and measure > best_eval_measures_higher_better[i-6]:
-                            old_best = best_eval_measures_higher_better[i-6].item(
-                            )
-                            best_eval_measures_higher_better[i -
-                                                             6] = measure.item()
-                            is_best = True
-                        if is_best:
-                            old_best_step = best_eval_steps[i]
-                            old_best_name = '/model-{}-best_{}_{:.5f}'.format(
-                                old_best_step, eval_metrics[i], old_best)
-                            model_path = args.log_directory + '/' + args.model_name + old_best_name
-                            if os.path.exists(model_path):
-                                command = 'rm {}'.format(model_path)
-                                os.system(command)
-                            best_eval_steps[i] = global_step
-                            model_save_name = '/model-{}-best_{}_{:.5f}'.format(
-                                global_step, eval_metrics[i], measure)
-                            print('New best for {}. Saving model: {}'.format(
-                                eval_metrics[i], model_save_name))
-                            checkpoint = {'global_step': global_step,
-                                          'model': model.state_dict(),
-                                          'optimizer': optimizer.state_dict(),
-                                          'best_eval_measures_higher_better': best_eval_measures_higher_better,
-                                          'best_eval_measures_lower_better': best_eval_measures_lower_better,
-                                          'best_eval_steps': best_eval_steps
-                                          }
-                            torch.save(checkpoint, args.log_directory +
-                                       '/' + args.model_name + model_save_name)
-                    eval_summary_writer.flush()
-                model.train()
-                block_print()
-                enable_print()
+            #         writer.flush()
+
+            # if args.do_online_eval and global_step and global_step % args.eval_freq == 0 and not model_just_loaded:
+            #     time.sleep(0.1)
+            #     model.eval()
+            #     with torch.no_grad():
+            #         eval_measures = online_eval(
+            #             model, dataloader_eval, gpu, ngpus_per_node, group, epoch, post_process=True)
+            #         # planar_mask = get_planar_mask(depth_gt)  # 重新计算一遍用于画图
+            #         planar_mask =get_planar_mask_depth_normal(depth_gt,normal_gt)
+            #         visualize_debug(save_dir, global_step, depth_gt,
+            #                         planar_mask, d_bins, inv_K, normal_gt_norm)
+            #     if eval_measures is not None:
+            #         exp_name = '%s' % (datetime.now().strftime('%m%d'))
+            #         log_txt = os.path.join(
+            #             args.log_directory + '/' + args.model_name, exp_name+'_logs.txt')
+            #         with open(log_txt, 'a') as txtfile:
+            #             txtfile.write(">>>>>>>>>>>>>>>>>>>>>>>>>Step:%d>>>>>>>>>>>>>>>>>>>>>>>>>\n" % (
+            #                 int(global_step)))
+            #             txtfile.write("{:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}, {:>7}\n".format('silog',
+            #                                                                                                    'abs_rel', 'log10', 'rms', 'sq_rel', 'log_rms', 'd1', 'd2', 'd3'))
+            #             txtfile.write("depth estimation\n")
+            #             line = ''
+            #             for i in range(9):
+            #                 line += '{:7.4f}, '.format(eval_measures[i])
+            #             txtfile.write(line+'\n')
+
+            #         for i in range(9):
+            #             eval_summary_writer.add_scalar(
+            #                 eval_metrics[i], eval_measures[i].cpu(), int(global_step))
+            #             measure = eval_measures[i]
+            #             is_best = False
+            #             if i < 6 and measure < best_eval_measures_lower_better[i]:
+            #                 old_best = best_eval_measures_lower_better[i].item(
+            #                 )
+            #                 best_eval_measures_lower_better[i] = measure.item()
+            #                 is_best = True
+            #             elif i >= 6 and measure > best_eval_measures_higher_better[i-6]:
+            #                 old_best = best_eval_measures_higher_better[i-6].item(
+            #                 )
+            #                 best_eval_measures_higher_better[i -
+            #                                                  6] = measure.item()
+            #                 is_best = True
+            #             if is_best:
+            #                 old_best_step = best_eval_steps[i]
+            #                 old_best_name = '/model-{}-best_{}_{:.5f}'.format(
+            #                     old_best_step, eval_metrics[i], old_best)
+            #                 model_path = args.log_directory + '/' + args.model_name + old_best_name
+            #                 if os.path.exists(model_path):
+            #                     command = 'rm {}'.format(model_path)
+            #                     os.system(command)
+            #                 best_eval_steps[i] = global_step
+            #                 model_save_name = '/model-{}-best_{}_{:.5f}'.format(
+            #                     global_step, eval_metrics[i], measure)
+            #                 print('New best for {}. Saving model: {}'.format(
+            #                     eval_metrics[i], model_save_name))
+            #                 checkpoint = {'global_step': global_step,
+            #                               'model': model.state_dict(),
+            #                               'optimizer': optimizer.state_dict(),
+            #                               'best_eval_measures_higher_better': best_eval_measures_higher_better,
+            #                               'best_eval_measures_lower_better': best_eval_measures_lower_better,
+            #                               'best_eval_steps': best_eval_steps
+            #                               }
+            #                 torch.save(checkpoint, args.log_directory +
+            #                            '/' + args.model_name + model_save_name)
+            #         eval_summary_writer.flush()
+            #     model.train()
+            #     block_print()
+            #     enable_print()
 
             model_just_loaded = False
             global_step += 1
@@ -1256,31 +1141,7 @@ def main():
     command = 'cp ' + sys.argv[1] + ' ' + args_out_path
     os.system(command)
 
-    save_files = True
-    if save_files:
-        aux_out_path = os.path.join(args.log_directory, args.model_name)
-        networks_savepath = os.path.join(aux_out_path, 'networks')
-        dataloaders_savepath = os.path.join(aux_out_path, 'dataloaders')
-
-        # ===== 核心修改：动态获取当前文件夹路径 =====
-        current_script = sys.argv[0]  # 当前执行的脚本路径（如 ./train.py 或 /a/b/train.py）
-        current_dir = os.path.dirname(
-            os.path.abspath(current_script))  # 当前脚本所在文件夹的绝对路径
-        # 若 networks/dataloaders 在当前文件夹下，直接拼接
-        networks_src = os.path.join(current_dir, 'networks', '*.py')
-        dataloaders_src = os.path.join(current_dir, 'dataloaders', '*.py')
-
-        # 复制当前执行脚本（原有逻辑）
-        script_name = os.path.basename(current_script)
-        command = f'cp {current_script} {os.path.join(aux_out_path, script_name)}'
-        os.system(command)
-
-        # ===== 替换硬编码的 nddepth，使用动态路径 =====
-        command = f'mkdir -p {networks_savepath} && cp {networks_src} {networks_savepath}'
-        os.system(command)
-        command = f'mkdir -p {dataloaders_savepath} && cp {dataloaders_src} {dataloaders_savepath}'
-        os.system(command)
-
+    save_files = False
     torch.cuda.empty_cache()
     args.distributed = args.world_size > 1 or args.multiprocessing_distributed
 

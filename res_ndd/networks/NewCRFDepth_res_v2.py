@@ -211,12 +211,6 @@ class NewCRFDepth(nn.Module):
         self.uncer_head2 = UncerHead2(input_dim=crf_dims[0])
 
         self.up_mode = 'bilinear'
-        if self.up_mode == 'mask':
-            self.mask_head2 = nn.Sequential(
-                nn.Conv2d(crf_dims[0], 64, 3, padding=1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(64, 16*9, 1, padding=0))
-            
         self.min_depth = min_depth
         self.max_depth = max_depth
 
@@ -283,7 +277,6 @@ class NewCRFDepth(nn.Module):
         e1 = nn.PixelShuffle(2)(e1)
         e0 = self.crf0(feats[0], e1)
 
-
         # normal and distance
         ppm_out2 = self.decoder2(feats)
 
@@ -300,14 +293,12 @@ class NewCRFDepth(nn.Module):
         
         # 距离预测 (0, 1) -> 映射到物理尺度
         local_distance = self.distance_head1(e4, scale=4)
-        local_distance = local_distance * self.max_depth # 映射到最大深度范围
-        
+        local_distance = local_distance *self.max_depth# 映射到最大深度范围
         # 不确定性预测 (0, 1)
         pred_uncertainty_nd = self.uncer_head2(e4, scale=4)
 
         # version 2
         offset = self.offset_head(e4, scale=4) # [B, 2, H, W]
-
         # 利用 offset 去采样“更可靠”的平面参数
         seed_normal = sample_with_offset(local_normal, offset)
         seed_distance = sample_with_offset(local_distance, offset)
@@ -322,7 +313,6 @@ class NewCRFDepth(nn.Module):
 
         # return depth_geo, pred_normal, pred_distance, pred_uncertainty_nd, e4
         # 非平面----------------------------------------
-
         # 3. Head 预测
         # 预测归一化的视差 (0, 1) 或者 深度
         # 如果是 DispHead，通常预测的是 sigmoid 输出

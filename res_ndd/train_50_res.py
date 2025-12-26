@@ -517,7 +517,7 @@ def main_worker(gpu, ngpus_per_node, args):
                 model.eval()
                 with torch.no_grad():
                     # eval_measures = online_eval(model, dataloader_eval, gpu, ngpus_per_node, group, epoch, post_process=True)
-                    eval_measures = online_eval(model, dataloader_eval, gpu, ngpus_per_node, group, epoch, post_process=False)
+                    # eval_measures = online_eval(model, dataloader_eval, gpu, ngpus_per_node, group, epoch, post_process=False)
                     save_w_geo_heatmap(w_geo,save_dir,global_step)
                 if eval_measures is not None:
                     exp_name = '%s'%(datetime.now().strftime('%m%d'))
